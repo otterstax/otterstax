@@ -1,3 +1,5 @@
+name: otterstax-tests
+
 services:
   mariadb1:
     image: mariadb:latest

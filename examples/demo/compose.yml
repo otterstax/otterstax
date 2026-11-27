@@ -6,7 +6,7 @@
 #
 #   docker compose -f examples/demo/compose.yml up -d
 #       → only backends (MariaDB/Postgres/ClickHouse)
-#         for iterating locally with `./build/server` (see up.sh --local)
+#         for iterating locally with `./build/Release/server` (see up.sh --local)
 #
 #   docker compose -f examples/demo/compose.yml --profile full up -d
 #       → backends + demo-otterstax (one command end-to-end)
@@ -145,19 +145,30 @@ services:
       AWS_DEFAULT_REGION: us-east-1
     volumes:
       - ./init/s3:/fixtures:ro
-    entrypoint: >
-      sh -c "
-        E=http://demo-rustfs:9000;
-        (aws --endpoint-url $$E s3api head-bucket --bucket demo-bucket 2>/dev/null || aws --endpoint-url $$E s3 mb s3://demo-bucket) &&
-        if [ -d /fixtures ]; then aws --endpoint-url $$E s3 cp --recursive /fixtures/ s3://demo-bucket/; fi &&
-        echo 'demo-bucket seeded.';
-      "
+    entrypoint:
+      - sh
+      - -ec
+      - |
+        endpoint=http://demo-rustfs:9000
+        for fixture in regions.csv promos.parquet; do
+          if [ ! -s "/fixtures/$$fixture" ]; then
+            echo "Missing or empty demo S3 fixture: $$fixture" >&2
+            exit 1
+          fi
+        done
+        aws --endpoint-url "$$endpoint" s3api head-bucket --bucket demo-bucket 2>/dev/null ||
+          aws --endpoint-url "$$endpoint" s3 mb s3://demo-bucket
+        aws --endpoint-url "$$endpoint" s3 cp --recursive /fixtures/ s3://demo-bucket/
+        for fixture in regions.csv promos.parquet; do
+          aws --endpoint-url "$$endpoint" s3api head-object --bucket demo-bucket --key "$$fixture" >/dev/null
+        done
+        echo 'demo-bucket seeded.'
     networks:
       - demo_net
 
   # Optional — brought up only with `--profile full`.
   demo-otterstax:
-    image: ghcr.io/otterstax/otterstax:0.2.0
+    image: ${OTTERSTAX_IMAGE:-ghcr.io/otterstax/otterstax:0.2.0}
     container_name: demo-otterstax
     profiles: ["full"]
     depends_on:

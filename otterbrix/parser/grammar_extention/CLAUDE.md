@@ -13,8 +13,8 @@ Two extensions live here:
 
 | Dir | extension_id | Claims |
 | --- | ------------ | ------ |
-| `s3/`   | `"s3"`   | `CREATE EXTERNAL TABLE`/`COPY … TO` whose location is an `s3://…` URI |
-| `file/` | `"file"` | the same statements whose location is a local path (anything not `s3://`) |
+| `otterbrix/parser/grammar_extention/s3/`   | `"s3"`   | `CREATE EXTERNAL TABLE`/`COPY … TO` whose location is an `s3://…` URI |
+| `otterbrix/parser/grammar_extention/file/` | `"file"` | the same statements whose location is a local path (anything not `s3://`) |
 
 Both recognise:
 
@@ -40,11 +40,11 @@ The core bison parser always runs **first**; only queries it rejects reach the r
 
 | File | Role |
 | ---- | ---- |
-| `<p>_ast.hpp`        | arena-allocated AST structs + `make_*` / `option_value` helpers (no PG nodes) |
-| `<p>_gram.y`         | reentrant bison grammar, `%name-prefix="<p>yy"`, root wrapped via `make_extension_node` |
-| `<p>_scan.l`         | reentrant flex scanner, `%option prefix="<p>yy"`, `%option extra-type="std::pmr::memory_resource*"` |
-| `<p>_extension.{hpp,cpp}` | `parse()` driver + `transform()` + `make_<p>_extension()` factory |
-| `CMakeLists.txt`     | one `otterbrix_add_parser_extension(<lib> PREFIX <p> SOURCES <p>_extension.cpp)` call |
+| `otterbrix/parser/grammar_extention/<p>/<p>_ast.hpp`        | arena-allocated AST structs + `make_*` / `option_value` helpers (no PG nodes) |
+| `otterbrix/parser/grammar_extention/<p>/<p>_gram.y`         | reentrant bison grammar, `%name-prefix="<p>yy"`, root wrapped via `make_extension_node` |
+| `otterbrix/parser/grammar_extention/<p>/<p>_scan.l`         | reentrant flex scanner, `%option prefix="<p>yy"`, `%option extra-type="std::pmr::memory_resource*"` |
+| `otterbrix/parser/grammar_extention/<p>/<p>_extension.{hpp,cpp}` | `parse()` driver + `transform()` + `make_<p>_extension()` factory |
+| `otterbrix/parser/grammar_extention/<p>/CMakeLists.txt` | one `otterbrix_add_parser_extension(<lib> PREFIX <p> SOURCES <p>_extension.cpp)` call |
 
 ## Conventions specific to these extensions
 
@@ -68,19 +68,19 @@ The core bison parser always runs **first**; only queries it rejects reach the r
   claimed by the core `CopyStmt` before any extension is consulted. Changing the surface syntax can let the
   core parser claim the statement first — guard this with tests.
 - **A trailing `;` is tolerated.** Both `create_stmt` and `copy_stmt` end with `opt_semicolon` (`%empty | ';'`)
-  so SQL-script drivers (`psql -f`, the demo's `run-queries.sh`) work alongside the integration libraries
+  so SQL-script drivers (`psql -f`, the demo's `examples/demo/run-queries.sh`) work alongside the integration libraries
   (`mysql.connector`, `psycopg2`) that strip the terminator before send. The scanner's catch-all rule
   (`. { return yytext[0]; }`) emits `;` as the literal character token. Coverage: `tests/unit/parser/test_{s3,file}_extension.cpp`
-  → `trailing ';' on CREATE EXTERNAL TABLE` and `trailing ';' on COPY ... TO`.
+  → `s3: trailing ';' is optional — no-terminator form also parses` and `file: trailing ';' is optional — no-terminator form also parses`.
 
 ## Adding a new extension
 
 1. Copy a sibling dir; rename files and the `<p>yy` prefix / `extension_id` throughout.
-2. Define the AST in `<p>_ast.hpp` (allocate from the parser arena).
+2. Define the AST in `otterbrix/parser/grammar_extention/<p>/<p>_ast.hpp` (allocate from the parser arena).
 3. Grammar top rule wraps the root: `*out = make_extension_node(resource, "<id>", root);`.
 4. In `parse()`, cheaply claim by leading keyword, build the AST, then return `NIL` if it isn't actually
    yours after inspection.
-5. Add the `CMakeLists.txt` `otterbrix_add_parser_extension(...)` call.
+5. Add the `otterbrix_add_parser_extension(...)` call in the extension’s CMake file.
 
 ## Build
 
@@ -92,7 +92,7 @@ Built as part of the normal build:
   exported component target; `otterbrix::sql` is not exported). `bison`/`flex` must be on PATH.
 - `otterbrix/CMakeLists.txt` adds both subdirectories, producing the static libs `otterbrix::s3_extension`
   and `otterbrix::file_extension`.
-- Tests live in `tests/unit/parser/test_s3_extension.cpp` and `test_file_extension.cpp` (in the
+- Tests live in `tests/unit/parser/test_s3_extension.cpp` and `tests/unit/parser/test_file_extension.cpp` (in the
   `test_parser` binary; build with `-DBUILD_TESTS=ON`).
 
 ## Registration and routing (wired)
@@ -104,7 +104,7 @@ registry. `otterbrix::s3_extension` / `otterbrix::file_extension` are linked int
 (`otterbrix/CMakeLists.txt`).
 
 `transform()` lowers each statement into an `otterstax::external::external_node_t` (defined header-only in
-`grammar_extention/external_node.hpp`, tagged `node_type::unused` like `kafka_node_t`) carrying
+`otterbrix/parser/grammar_extention/external_node.hpp`, tagged `node_type::unused` like `kafka_node_t`) carrying
 `op` (create/copy), the target (`external_target`: up to three parts as written, unquoted identifiers
 folded to lower case, placed as otterbrix places them — `t`, `s.t`, `x.s.t` (`x` a connection or a local
 database), its empty slots the session's place; a fourth part is

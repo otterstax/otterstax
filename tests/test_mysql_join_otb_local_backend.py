@@ -14,12 +14,8 @@
 # its storage's scan (the JOIN is not pushed down: one side is local) and JOINs
 # the two in-process.
 #
-# The previously-disabled version of this test used a bigint JOIN key, which
-# silently dropped every row because of an int width mismatch between the
-# `bigint` local declaration and the MariaDB INT column surfaced by
-# `mysql_to_chunk` — the same width sensitivity we already saw on the parquet
-# side. Using `campaign_name` (string = string) avoids the issue entirely
-# and demonstrates the JOIN actually works.
+# The fixture joins on `campaign_name` to exercise a string key on both
+# sides of the local/backend JOIN.
 
 import sys
 

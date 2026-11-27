@@ -6,30 +6,15 @@
 #   1. CREATE EXTERNAL TABLE for an s3 parquet fixture (regions.parquet)
 #         → otterbrix loads it into its own internal storage
 #   2. Stage selected MariaDB `campaigns` rows into an otterbrix-internal
-#      table (workaround for a JOIN-key width mismatch — see below).
+#      table for an engine-local JOIN.
 #   3. CREATE TABLE + INSERT INTO … SELECT to persist the JOIN result.
 #   4. COPY (SELECT * FROM internal_table) TO 's3://...' WITH format='csv' to
 #      dump the persisted result back out to s3.
 #   5. CREATE EXTERNAL TABLE over the dumped csv to read it back and verify
 #      the row count + campaign_id set.
 #
-# Why the staging step is still here (tests/CLAUDE.md, "JOIN-key width
-# sensitivity", has the full story):
-# A direct `JOIN MariaDB.campaigns ⋈ engine.regions ON campaign_id` is a plan
-# shape the engine DOES support (see examples/demo/sql/step_4.sql, which runs
-# exactly this shape against PG every demo run and returns 14 rows). The
-# blocker on this particular path is the JOIN-key type width:
-#   - regions.parquet's campaign_id is int64 (parquet loader output).
-#   - MariaDB's campaigns.campaign_id is INT (int32), which `mysql_to_chunk`
-#     surfaces unchanged in the rows the federation's scan hands the engine
-#     for the backend table.
-# Equi-JOIN across int32 and int64 silently drops every row in otterbrix,
-# the same failure mode we already burnt-in for `int` vs `bigint` local
-# declarations against parquet. Staging the backend rows into a `bigint`
-# engine table first normalises the width and the in-engine JOIN goes
-# through. Replace this with a direct backend-on-the-left JOIN once the
-# backend-translator width can be coerced (CAST in the JOIN predicate, or a
-# wider mysql_to_chunk mapping).
+# The staging step also exercises copying a backend result into a local table.
+# The staged key uses BIGINT, matching the Parquet fixture's int64 column.
 
 import sys
 
@@ -85,11 +70,7 @@ def run(local=False):
     regions_total = int(_scalar(cur, f"select count(*) from {INTERNAL_DB}.regions"))
     assert regions_total == 200, f"regions load size {regions_total} != 200"
 
-    # ── 2. Stage selected backend rows into otterbrix-internal storage so the
-    #       JOIN can run entirely within the engine. campaign_id is declared
-    #       bigint so its width matches the int64 column type the parquet
-    #       loader exposes on regions — a width mismatch on the JOIN key
-    #       causes the equi-JOIN to drop every row silently.
+    # ── 2. Stage selected backend rows into otterbrix-internal storage.
     cur.execute(
         f"CREATE TABLE {INTERNAL_DB}.campaigns_stg ("
         f"  campaign_id bigint,"

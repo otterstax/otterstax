@@ -94,13 +94,17 @@ fi
 # Step 2: Build
 # ---------------------------------------------------------------------------
 echo "==> Building otterstax_bench (parallel: $PARALLEL_JOBS)..."
-/usr/local/bin/cmake --build "$BUILD_DIR" --parallel "$PARALLEL_JOBS" --target otterstax_bench
+cmake --build "$BUILD_DIR" --parallel "$PARALLEL_JOBS" --target otterstax_bench
 
 # ---------------------------------------------------------------------------
 # Step 3: LD_LIBRARY_PATH — collect all conan lib dirs
 # ---------------------------------------------------------------------------
-CONAN_LIBS="$(find /conan/.conan2/p/b/*/p/lib -maxdepth 0 2>/dev/null | tr '\n' ':')"
-export LD_LIBRARY_PATH="${CONAN_LIBS}${LD_LIBRARY_PATH:-}"
+# Optional host layout (e.g. inside the build container): all conan lib dirs. The find
+# fails harmlessly where /conan does not exist — the binary's DT_RPATH resolves the libs.
+CONAN_LIBS="$(find /conan/.conan2/p/b/*/p/lib -maxdepth 0 2>/dev/null | tr '\n' ':' || true)"
+if [[ -n "$CONAN_LIBS" ]]; then
+    export LD_LIBRARY_PATH="${CONAN_LIBS}${LD_LIBRARY_PATH:-}"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Create timestamped results directory
@@ -129,52 +133,19 @@ BENCH_ARGS=(
 )
 [[ -n "$FILTER" ]] && BENCH_ARGS+=("--benchmark_filter=$FILTER")
 
-# The PostgreSQL raw_parser has a global-state teardown that causes a segfault
-# at process exit — all benchmarks complete before it fires.  We tolerate exit
-# code 139 (SIGSEGV) as a known-benign crash.
 set +e
 "$BENCH_BIN" "${BENCH_ARGS[@]}" 2>&1 | tee "$LOG_OUT"
 EXIT_CODE=$?
 set -e
 
-if [[ $EXIT_CODE -ne 0 && $EXIT_CODE -ne 139 ]]; then
+if [[ $EXIT_CODE -ne 0 ]]; then
     echo ""
     echo "ERROR: otterstax_bench exited with code $EXIT_CODE" >&2
     exit "$EXIT_CODE"
 fi
 
 # ---------------------------------------------------------------------------
-# Step 6: Fix truncated JSON (written at process exit, may be cut off by crash)
-# ---------------------------------------------------------------------------
-python3 - "$JSON_OUT" <<'PYEOF'
-import sys, json
-
-path = sys.argv[1]
-if not path:
-    sys.exit(0)
-
-try:
-    raw = open(path).read()
-except FileNotFoundError:
-    print(f"WARNING: {path} not found — no JSON output.", file=sys.stderr)
-    sys.exit(0)
-
-try:
-    json.loads(raw)
-except json.JSONDecodeError:
-    last_close = raw.rfind('\n    }')
-    if last_close >= 0:
-        fixed = raw[:last_close + 6] + '\n  ]\n}\n'
-        with open(path, 'w') as f:
-            f.write(fixed)
-        print("(Fixed truncated JSON output.)")
-    else:
-        print(f"WARNING: could not repair {path}", file=sys.stderr)
-        sys.exit(0)
-PYEOF
-
-# ---------------------------------------------------------------------------
-# Step 7: Print summary table
+# Step 6: Print summary table
 # ---------------------------------------------------------------------------
 python3 - "$JSON_OUT" <<'PYEOF' | tee -a "$LOG_OUT"
 import sys, json

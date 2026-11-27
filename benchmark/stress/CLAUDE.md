@@ -57,15 +57,15 @@ Results land in `benchmark_results/stress/<YYYYMMDD_HHMMSS>/`.
 
 ---
 
-## CLI reference (`run_stress_benchmarks.sh`)
+## CLI reference (`benchmark/stress/run_stress_benchmarks.sh`)
 
 ```text
 -p, --profile FILE   YAML profile defining all stages. Overrides --workers-* and
                      --duration-* flags.
---workers-small N    Workers per frontend, stage 1 (default: 3)  [ignored with -p]
---workers-medium N   Workers per frontend, stage 2 (default: 15) [ignored with -p]
---workers-heavy N    Workers per frontend, stage 3 (default: 30) [ignored with -p]
---duration-small N   Stage 1 active duration in seconds (default: 30)  [ignored with -p]
+--workers-small N    Workers per frontend, stage 1 (default: 1)  [ignored with -p]
+--workers-medium N   Workers per frontend, stage 2 (default: 5) [ignored with -p]
+--workers-heavy N    Workers per frontend, stage 3 (default: 15) [ignored with -p]
+--duration-small N   Stage 1 active duration in seconds (default: 60)  [ignored with -p]
 --duration-medium N  Stage 2 active duration in seconds (default: 60)  [ignored with -p]
 --duration-heavy N   Stage 3 active duration in seconds (default: 90)  [ignored with -p]
 --out-dir DIR        Result root (default: benchmark_results/stress/<ts>)
@@ -170,7 +170,7 @@ A `⚠` marks p50/p95/p99 values that exceed 3× the baseline in the latency rat
 
 ## Python module internals
 
-### `profiles.py`
+### `benchmark/stress/profiles.py`
 
 - `StageConfig` dataclass: name, label, workers_per_frontend, duration_s, ramp_secs,
   query_weights, query_pool, frontends.
@@ -182,7 +182,7 @@ A `⚠` marks p50/p95/p99 values that exceed 3× the baseline in the latency rat
   weight, then shuffles.  SQL strings are imported from
   `benchmark/benchmarks/queries.py` (no duplication).
 
-### `stress_runner.py`
+### `benchmark/stress/stress_runner.py`
 
 - Each worker thread: opens **one persistent connection**, cycles through its shuffled
   copy of the pool round-robin, records per-query latency in ms, reconnects on error
@@ -192,7 +192,7 @@ A `⚠` marks p50/p95/p99 values that exceed 3× the baseline in the latency rat
 - `run_stage(stage_config, host) → {frontend: [WorkerStats]}` — starts all threads,
   waits `duration_s + ramp_secs`, sets `stop_event`, joins all threads.
 
-### `report.py`
+### `benchmark/stress/report.py`
 
 - `build_stage_result(stage_config, raw_stats) → StageResult` — QPS = total_queries /
   duration_s (comparable across stages regardless of ramp timing).  Aggregates
@@ -209,7 +209,7 @@ A `⚠` marks p50/p95/p99 values that exceed 3× the baseline in the latency rat
   - **"Per-query-type Breakdown"** section: one sub-table per category showing count,
     QPS, p50/p95/p99 across all stages with S2/S1 and S3/S1 ratio columns.
 
-### `stress_main.py`
+### `benchmark/stress/stress_main.py`
 
 CLI entry point.  Parses args → loads profile or builds defaults → loops over stages
 (run → aggregate → write JSON → print summary → cool down) → writes degradation report.
@@ -232,5 +232,5 @@ CLI entry point.  Parses args → loads profile or builds defaults → loops ove
 
 1. Add the SQL list to `benchmark/benchmarks/queries.py` (so it stays shared with the
    serial benchmark harness).
-2. Register the new key in `VALID_POOL_KEYS` in `stress/profiles.py`.
-3. Document it in the `query_pool` table above and in `STRESS_BENCHMARK_PLAN.md`.
+2. Register the new key in `VALID_POOL_KEYS` in `benchmark/stress/profiles.py`.
+3. Document it in the `query_pool` table above.

@@ -1,14 +1,14 @@
 # Quick-start demo — one command brings up the whole federated stack:
 #
-#     cd examples/quick_start && docker compose up -d
+#     cd examples/quick_start && docker compose up --wait
 #
 # Two independent PostgreSQL backends + one MariaDB + one ClickHouse + RustFS
 # (S3) + Kafka + OtterStax. Everything is seeded from the committed files under
 # init/ (databases from init/<engine>/init.sql, s3 objects from init/s3/*, kafka
 # events from init/kafka/orders.ndjson). Named volumes keep the DB/s3 data across
-# restarts; a full `docker compose down -v` wipes them and the next `up` rebuilds
-# identical data from those same files. The Kafka broker is ephemeral (re-seeded
-# on every `up`).
+# container restarts and `down` without `-v`. The seed jobs replace the S3 source
+# objects, clear exports, and recreate the Kafka demo topics whenever they run.
+# `down` removes the OtterStax and broker containers and their local state.
 #
 # Only the PostgreSQL wire (8817) is published — the demo is driven entirely
 # with psql. See README.md.
@@ -123,7 +123,7 @@ services:
     networks: [quickstart_net]
 
   # One-shot: create the bucket and (re)upload the committed s3 fixtures, then
-  # exit. Idempotent — runs on every `up`, re-seeds anything a wiped volume lost.
+  # exit. Each run overwrites the source objects and clears the export prefix.
   qs-rustfs-init:
     image: amazon/aws-cli:latest
     container_name: qs-rustfs-init
@@ -139,20 +139,31 @@ services:
     # Seed the three source objects on every `up`. Also clear any `exports/`
     # left in the persisted volume from a previous run — that prefix is demo
     # output (written by example 7's COPY), so a fresh start must not show it.
-    entrypoint: >
-      sh -c "
-        E=http://qs-rustfs:9000;
-        aws --endpoint-url $$E s3api head-bucket --bucket quickstart-bucket 2>/dev/null || aws --endpoint-url $$E s3 mb s3://quickstart-bucket;
-        aws --endpoint-url $$E s3 rm --recursive --quiet s3://quickstart-bucket/exports/ 2>/dev/null;
-        aws --endpoint-url $$E s3 cp --recursive --quiet /fixtures/ s3://quickstart-bucket/;
-        echo 'quickstart-bucket seeded (exports cleared).';
-      "
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        objects='regions.csv product_costs.parquet promotions.ndjson'
+        for object in $$objects; do
+          if [ ! -s "/fixtures/$$object" ]; then
+            echo "Missing or empty S3 fixture: /fixtures/$$object" >&2
+            exit 1
+          fi
+        done
+        s3_aws() { aws --endpoint-url http://qs-rustfs:9000 "$$@"; }
+        s3_aws s3api head-bucket --bucket quickstart-bucket 2>/dev/null ||
+          s3_aws s3 mb s3://quickstart-bucket
+        s3_aws s3 rm --recursive --quiet s3://quickstart-bucket/exports/
+        for object in $$objects; do
+          s3_aws s3 cp --quiet "/fixtures/$$object" "s3://quickstart-bucket/$$object"
+        done
+        echo 'quickstart-bucket seeded (exports cleared).'
     networks: [quickstart_net]
 
   # Kafka broker (redpanda) for the streaming examples (Kafka section in README.md).
   # otterstax reaches it in-network at qs-kafka:9092; the external listener on 19094
   # is only for optional host-side `rpk`/debugging — psql never needs it. No data
-  # volume: the broker is ephemeral and re-seeded on every `up` by qs-kafka-init.
+  # volume: removing the broker container discards its state.
   qs-kafka:
     image: redpandadata/redpanda:v25.3.15
     container_name: qs-kafka
@@ -175,8 +186,8 @@ services:
     networks: [quickstart_net]
 
   # One-shot: (re)create the topics and produce the committed order events, then
-  # exit. Idempotent — delete+create+produce on every `up` gives exactly the 40
-  # committed events regardless of prior state. qs_orders is the input feed;
+  # exit. A successful seed run truncates the demo state by deleting both topics
+  # before creating them and producing the 40 fixture events. qs_orders is the input feed;
   # qs_orders_paid is the (empty) output topic the CREATE STREAM (K4) writes to.
   qs-kafka-init:
     image: redpandadata/redpanda:v25.3.15
@@ -186,17 +197,28 @@ services:
         condition: service_healthy
     volumes:
       - ./init/kafka:/fixtures:ro
-    entrypoint: >
-      sh -c "
-        rpk -X brokers=qs-kafka:9092 topic delete qs_orders qs_orders_paid 2>/dev/null || true;
-        rpk -X brokers=qs-kafka:9092 topic create qs_orders qs_orders_paid -p 1 || true;
-        rpk -X brokers=qs-kafka:9092 topic produce qs_orders < /fixtures/orders.ndjson;
-        echo 'kafka seeded: qs_orders produced.';
-      "
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if [ ! -s /fixtures/orders.ndjson ]; then
+          echo 'Missing or empty Kafka fixture: /fixtures/orders.ndjson' >&2
+          exit 1
+        fi
+        broker_rpk() { rpk -X brokers=qs-kafka:9092 "$$@"; }
+        topics=$$(broker_rpk topic list)
+        for topic in qs_orders qs_orders_paid; do
+          if printf '%s\n' "$$topics" | awk '{print $$1}' | grep -Fxq "$$topic"; then
+            broker_rpk topic delete "$$topic"
+          fi
+        done
+        broker_rpk topic create qs_orders qs_orders_paid -p 1
+        broker_rpk topic produce qs_orders < /fixtures/orders.ndjson
+        echo 'kafka seeded: qs_orders produced.'
     networks: [quickstart_net]
 
   qs-otterstax:
-    image: ghcr.io/otterstax/otterstax:0.2.0
+    image: ${OTTERSTAX_IMAGE:-ghcr.io/otterstax/otterstax:0.2.0}
     container_name: qs-otterstax
     depends_on:
       qs-postgres-shop:
@@ -211,6 +233,10 @@ services:
         condition: service_healthy
       qs-kafka:
         condition: service_healthy
+      qs-rustfs-init:
+        condition: service_completed_successfully
+      qs-kafka-init:
+        condition: service_completed_successfully
     ports:
       - "8817:8817"    # PostgreSQL wire — the only published frontend
     volumes:

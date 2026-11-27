@@ -12,16 +12,16 @@ is the only catalog: a remote table is rows of `pg_database` (`datconnection`), 
 
 | File | What |
 |------|------|
-| `discovery.hpp` | The handwritten discovery queries the backend agents run (`otterbrix/federation/backend_agent.hpp`), the schema probe, `make_discovery_error`, `escape_sql_literal` (the quote doubled; the backslash doubled on MySQL / ClickHouse, and on PostgreSQL inside `E'…'` for a value that holds one) |
-| `registration.hpp` | `register_connections` (startup), `registration_target` / `registration_plans` (a table a statement missed), `check_table_scope` (DDL of a one-table connection) |
-| `ownership.hpp` | `check_write_ownership(resource, target, drops_schema)` |
-| `sql_tokens.hpp` | `engine_tokens`: the names and punctuation of the engine's text, literals / comments / dollar quotes / `$n` left out — the one lexer of the passes below |
-| `dotted_names.hpp` | `qualify_host_calls`: a host function's call, bare or `pg_catalog.`, written `local.public.f()` (not after INTO / TABLE / EXISTS / ON / REFERENCES / VIEW / TYPE, where it names a table); `split_dotted_names`: a quoted qualifier `"c.ns"` (`c` a connection or `local`, the next token a `.`) written `"c"."ns"` before the parse (`query_session_t::parse_sql`); literals, comments, dollar quotes, aliases untouched |
-| `host_functions.hpp` | The host's functions (`version()`, `obj_description`, `col_description`), registered into `local.public` by `register_connections` at every startup |
+| `catalog/discovery.hpp` | The handwritten discovery queries the backend agents run (`otterbrix/federation/backend_agent.hpp`), the schema probe, `make_discovery_error`, `escape_sql_literal` (the quote doubled; the backslash doubled on MySQL / ClickHouse, and on PostgreSQL inside `E'…'` for a value that holds one) |
+| `catalog/registration.hpp` | `register_connections` (startup), `registration_target` / `registration_plans` (a table a statement missed), `check_table_scope` (DDL of a one-table connection) |
+| `catalog/ownership.hpp` | `check_write_ownership(resource, target, drops_schema)` |
+| `catalog/sql_tokens.hpp` | `engine_tokens`: the names and punctuation of the engine's text, literals / comments / dollar quotes / `$n` left out — the one lexer of the passes below |
+| `catalog/dotted_names.hpp` | `qualify_host_calls`: a host function's call, bare or `pg_catalog.`, written `local.public.f()` (not after INTO / TABLE / EXISTS / ON / REFERENCES / VIEW / TYPE, where it names a table); `split_dotted_names`: a quoted qualifier `"c.ns"` (`c` a connection or `local`, the next token a `.`) written `"c"."ns"` before the parse (`query_session_t::parse_sql`); literals, comments, dollar quotes, aliases untouched |
+| `catalog/host_functions.hpp` | The host's functions (`version()`, `obj_description`, `col_description`), registered into `local.public` by `register_connections` at every startup |
 
 Nothing here throws; every failure is a `core::result_wrapper_t` / `core::error_t` value.
 
-## Registration (`registration.hpp`)
+## Registration (`catalog/registration.hpp`)
 
 Every statement runs on the backend actor's registration session, so no SQL reaches a backend.
 
@@ -41,7 +41,7 @@ Every statement runs on the backend actor's registration session, so no SQL reac
   database `local`, leaves fresh sessions without a place (`ALTER SYSTEM SET search_path = ''`) and
   refuses an alias that is the name of an existing local database (the engine would read the first
   part of a three-part name as both) — with connections or none.
-- **Host functions** (`host_functions.hpp`): right after `CREATE DATABASE local`, `register_connections`
+- **Host functions** (`catalog/host_functions.hpp`): right after `CREATE DATABASE local`, `register_connections`
   registers `version()` (TEXT, `otterstax::version_text`, `utility/server_version.hpp`: `PostgreSQL 18.0
   (OtterStax)`, the same version as the PostgreSQL wire's `server_version`) and the catalog functions Django's
   introspection calls that the engine does not have yet — `obj_description(oid, catalog)` /
@@ -61,7 +61,7 @@ Every statement runs on the backend actor's registration session, so no SQL reac
   `((x) IN (<pg_catalog's relations and the session's place's>))` — the search path's meaning, which no
   host function can give (a kernel sees no session's place): OtterStax's own tables, another connection's
   and another schema's are not visible
-  before the parse (`qualify_host_calls`, `dotted_names.hpp`; the reason is the comment over it), which a
+  before the parse (`qualify_host_calls`, `catalog/dotted_names.hpp`; the reason is the comment over it), which a
   qualified call reaches from any place: a connection's, `local`'s, none. Drop the pass once pg_catalog
   can hold a host's function.
 - **Names.** Lower case, one engine database per connection: `c.d.ns.t` with `d` the configured
@@ -96,14 +96,15 @@ Every statement runs on the backend actor's registration session, so no SQL reac
   DDL and every DDL of a connection without `table:` go on as before. A short name in a place that is
   the connection's database is not seen (the engine does not name the place's connection).
 
-## Owned database names (`ownership.hpp`)
+## Owned database names (`catalog/ownership.hpp`)
 
-A client's `CREATE DATABASE` / `DROP DATABASE` is a schema of `local` or refused before it gets here
-(`session::plan::place_namespace_ddl`); what still names an engine database is refused
-(`invalid_parameter` `database '<name>' is owned by connection '<owner>'`, ASCII case-insensitively): a
-connection alias of config.yaml, `federation` and `local`. The session passes
-`remote_backends_t::aliases()`.
-Inside them (`check_write_ownership`, `invalid_parameter` `... is owned by OtterStax ...`): any DDL or DML
+A client's `CREATE DATABASE` / `DROP DATABASE` never reaches this guard: the session turns it into a
+schema of `local` (a MySQL or Spark client) or refuses it (a PostgreSQL or Flight SQL client) in
+`session::plan::place_namespace_ddl`, whatever the name — a connection alias included
+(`tests/system/test_database_ownership_guard.cpp`). At startup `catalog::register_connections` refuses
+an alias that is the name of an existing local database (`registration: connection "<name>" has the
+name of a local database; rename it in config.yaml`).
+What the guard owns (`check_write_ownership`, `invalid_parameter` `... is owned by OtterStax ...`): any DDL or DML
 of a relation written in `federation` (`session::plan::write_target`; CREATE EXTERNAL TABLE too), and
 DROP SCHEMA of `local.kafka`, the Kafka objects (a client's DROP SCHEMA names a schema of local). A
 relation name the place completes into `federation` is not seen.
@@ -111,5 +112,5 @@ relation name the place completes into `federation` is not seen.
 ## Tests
 
 `tests/federation/test_federation_registration.cpp` over a real otterbrix and fake backends;
-`tests/system/test_restart_reconciliation.cpp`, `test_catalog.cpp`, `test_backend_discovery.cpp`,
-`test_database_ownership_guard.cpp`, `test_registration_scope.cpp` over the session stack.
+`tests/system/test_restart_reconciliation.cpp`, `tests/system/test_catalog.cpp`, `tests/system/test_backend_discovery.cpp`,
+`tests/system/test_database_ownership_guard.cpp`, `tests/system/test_registration_scope.cpp` over the session stack.

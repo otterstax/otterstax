@@ -26,12 +26,9 @@ RustFS bucket) so file vs s3 are directly comparable:
                   `web_events` ⋈ otterbrix-internal `weights`, all on
                   campaign_id.  Models the "everything joined together" shape.
 
-The join keys are int64 on every side (parquet/csv loaders emit int64; the
-engine table declares `campaign_id bigint`) — a direct backend.campaign_id
-(int32) ⋈ s3.campaign_id (int64) silently drops all rows (see tests/CLAUDE.md,
-"JOIN-key width sensitivity"), so
-these benchmarks deliberately resolve every side to otterbrix-internal storage
-first, exactly like the tests they are modelled on.
+The parquet/csv fixtures supply int64 join keys and the engine table declares
+`campaign_id bigint`. The benchmarks measure JOINs between tables already
+loaded into otterbrix-internal storage, like the tests they are modelled on.
 
 Output reuses common.BenchmarkResult / write_txt_result, so results land beside
 the other benchmarks and feed generate_summary.py unchanged.

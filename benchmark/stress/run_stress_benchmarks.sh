@@ -51,10 +51,10 @@ Profile:
                        Built-in profiles: benchmark/stress/profiles/{default,select_only}.yaml
 
 Stage knobs (ignored when --profile is given):
-  --workers-small N    Workers per frontend, stage 1 (default: 3)
-  --workers-medium N   Workers per frontend, stage 2 (default: 15)
-  --workers-heavy N    Workers per frontend, stage 3 (default: 30)
-  --duration-small N   Stage 1 active duration in seconds (default: 30)
+  --workers-small N    Workers per frontend, stage 1 (default: 1)
+  --workers-medium N   Workers per frontend, stage 2 (default: 5)
+  --workers-heavy N    Workers per frontend, stage 3 (default: 15)
+  --duration-small N   Stage 1 active duration in seconds (default: 60)
   --duration-medium N  Stage 2 active duration in seconds (default: 60)
   --duration-heavy N   Stage 3 active duration in seconds (default: 90)
 

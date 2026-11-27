@@ -5,14 +5,15 @@
 
 A SQL federation server: one endpoint over several databases, reached through the MySQL and
 PostgreSQL wire protocols, Apache Arrow Flight SQL and Spark Connect. OtterStax is built on the
-Otterbrix query engine, which plans and runs every statement; the tables of the remote databases
-are tables of its catalog, read and written through their backends.
+Otterbrix query engine, which plans and executes queries against local and remote tables. Remote
+tables appear in its catalog and are read and written through their backends.
 
 ## Features
 
 - Protocols: MySQL, PostgreSQL, Flight SQL, Spark Connect (PySpark 3.5–4.2)
-- Federation: MariaDB / MySQL, PostgreSQL and ClickHouse backends in one statement; a query block
-  over one backend is pushed down to it whole
+- Federation: query MariaDB / MySQL, PostgreSQL and ClickHouse backends in one statement. A block
+  over one backend can be pushed down whole when its dialect supports the plan. Reads can also
+  combine backend scans with execution in Otterbrix.
 - Transactions over local and remote tables (PostgreSQL / MySQL backends), SAVEPOINT included
 - **File and S3 external tables**: `CREATE EXTERNAL TABLE` loads parquet, csv or ndjson from a local
   path or an `s3://…` URI; `COPY (<select>) TO '…'` exports a query result — see
@@ -34,9 +35,16 @@ psql -h localhost -p 8817 -U demo local        # `local` is the engine database 
 mysql -h 127.0.0.1 -P 8816 -u demo
 ```
 
-A PostgreSQL client names its place: a connection alias, `alias.namespace`, `local` or
+The PostgreSQL wire (8817) is published by the quick start stack, `examples/quick_start/`; the
+repository's own `compose.yml` publishes Flight SQL (8815), the MySQL wire (8816) and Tracy (8086).
+
+Agents querying a running OtterStax server can use the [OtterStax SQL skill](.claude/skills/otterstax-sql/SKILL.md)
+for connection settings, federated SQL examples and dialect constraints.
+
+A PostgreSQL client names its initial place: a connection alias, `alias.namespace`, `local` or
 `local.namespace` (above, `local`). A name that is neither a connection nor `local` is refused
-(`FATAL 3D000`); naming nothing leaves the session no place and short names refuse.
+(`FATAL 3D000`). Without a place, short names fail. Use `SET search_path = 'local.ns'`
+with an existing namespace to change the place on the same connection.
 
 ## Connection configuration
 
@@ -45,9 +53,9 @@ There is a **single config file, `config.yaml`**: the server settings under `ser
 runtime add / remove API; edit the file and restart.
 
 The path is `--config PATH` (default `config.yaml`, relative to the working directory). The file
-must exist and must set `service.engine.data_dir`, the directory the engine keeps its tables, WAL
-and logs in; without either the server writes the reason to stderr and exits with code 1. Every
-other key has a default. The public image reads `/otterstax/config.yaml` (see [Docker](#docker)).
+must exist and must set `service.engine.data_dir`, which holds the engine's tables, WAL and,
+by default, logs. If either is absent, the server writes the reason to stderr and exits with code 1.
+The public image reads `/otterstax/config.yaml` (see [Docker](#docker)).
 
 ```yaml
 service:
@@ -56,6 +64,7 @@ service:
   postgres:   { port: 8817 }           # wire-server port, not a backend
   spark_connect: { host: "0.0.0.0", port: 15002 }
   connection_retry: { max_attempts: 10, delay_ms: 2000 }   # optional; default one attempt
+  engine: { data_dir: /tmp/test_collection_sql/base }     # required
 
 connections:
   mysql:
@@ -65,7 +74,7 @@ connections:
       username: demo
       password: demo
       database: bill
-      table: ""                        # optional: a name limits the startup discovery to it
+      table: ""                        # optional: scope discovery to this table
   postgresql:
     - alias: pg
       host: demo-postgres
@@ -102,18 +111,26 @@ A table is written in three parts, `connection.namespace.table` — the first pa
 namespace is a schema of the connection's configured database, a MySQL / ClickHouse namespace one of
 its databases.
 
+On the [quick start stack](examples/quick_start/README.md), this query returns 1000 matches:
+
 ```sql
-SELECT o.order_id, c.name
-FROM   mysql.bill.orders o
-JOIN   pg.shop.customers c ON o.customer_id = c.customer_id;
+SELECT count(*) AS matches
+FROM sales.ops.orders o
+JOIN pgshop.shop.customers c ON c.customer_id = o.customer_id;
 ```
 
-Short names (`table`, `schema.table`) are completed by the session's place — only what you chose at
-connect (the PostgreSQL `database`, the MySQL handshake database / `USE`, Spark's current database):
-a connection (`uid`), one of its namespaces (`uid.ns`), or `local` / `local.ns` for your own tables.
-Without a choice there is no place and short names refuse; four-part names are refused.
+For another stack, use its configured connection aliases and backend namespaces.
 
-A table created on the backend after startup is found on its first use.
+Short names (`table`, `schema.table`) use the session's current place: a connection (`uid`), one
+of its namespaces (`uid.ns`), or `local` / `local.ns` for your own tables. The PostgreSQL `database`
+sets the initial place. Change it with `SET search_path = 'local.ns'`, using an existing namespace.
+MySQL uses its handshake database and `USE`. Spark uses its current database.
+Without a place short names fail. Four-part table names are refused.
+
+A table added after startup can be discovered on first use within the configured connection scope.
+With `table:` set, other tables are excluded. The server retries the statement only if registration
+succeeds, it can rebuild the statement and the session is outside a transaction block. A miss
+inside a block can register the table while returning an error. Run `ROLLBACK` before retrying.
 
 Ready-made `config.yaml` files ship with each stack: `examples/demo/`, `examples/quick_start/`,
 `tests/scripts/`, `scripts/database/` and `benchmark/` (plus a template at the repo root).
@@ -137,14 +154,13 @@ COPY (SELECT * FROM eg.t) TO 's3://bucket/exported/out.csv' WITH (s3_alias = 'de
 
 - Formats: `parquet` (snappy, brotli, zlib, lz4, zstd), `csv`, `ndjson`, read and write.
 - The target is named as in `CREATE TABLE`; its schema must exist.
-- A loaded table is an ordinary engine table: `SELECT`, `INSERT`, JOINs with local, external and
-  remote tables, `COPY ... TO`. Keep JOIN-key widths equal on both sides (an int32 against an
-  int64 key matches nothing; see [`CLAUDE.md`](CLAUDE.md#external-tables--file--s3)).
+- A loaded table is an ordinary engine table. Use `SELECT`, `INSERT`, JOINs with local, external
+  and remote tables, and `COPY ... TO`.
 - S3 objects are streamed, never staged on local disk.
 
 ## Requirements
 
-- CMake 3.15+, a C++20 compiler with coroutines, Conan 2.x
+- CMake 3.24+, a C++20 compiler with coroutines, Conan 2.x, Bison and Flex
 - Docker & Docker Compose, Python 3 (clients and tests)
 
 ## Building
@@ -153,12 +169,15 @@ otterbrix (`1.0.0b2-rc-7`) and actor-zeta come from the `otterbrix` Conan remote
 builds otterbrix from its recipe where the remote has no binary for your configuration (see
 [`CLAUDE.md`](CLAUDE.md#critical-dependency-versions-conanfilepy)). Size the build jobs to your RAM
 (about 1.5 GB per job).
+On macOS with Homebrew Bison, pass `-DBISON_EXECUTABLE=/opt/homebrew/opt/bison/bin/bison`
+to CMake. The system Bison is too old for the parser build.
 
 ```bash
 pip install "conan>=2.0" && conan profile detect --force
 conan remote add otterbrix https://conan.otterbrix.com
 conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
-cmake -S . -B build/Release -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 cmake --build build/Release --parallel <JOBS>
 ./build/Release/server --config config.yaml
 ```
@@ -175,16 +194,16 @@ docker pull ghcr.io/otterstax/otterstax:0.2.0      # or: otterstax/otterstax:0.2
 
 docker run -d --name otterstax --stop-timeout 60 \
   -p 8815:8815 -p 8816:8816 -p 8817:8817 -p 15002:15002 \
-  -v "$PWD/config.yaml:/otterstax/config.yaml:ro" \
   -v otterstax-data:/otterstax/data \
   ghcr.io/otterstax/otterstax:0.2.0
 ```
 
-The image is `linux/amd64`. Two paths matter:
+The image is published for Linux amd64. Two paths matter:
 
 - `/otterstax/config.yaml` is the config. The image ships one that sets only the data directory,
-  so the container also starts with no mount: default ports, no connections. Your file replaces
-  it whole, so it has to carry the same line:
+  so the command above starts with default ports and no connections. To supply
+  connection settings, add `-v "$PWD/config.yaml:/otterstax/config.yaml:ro"` before the image
+  name. Set the following value in that file to use the named volume in this example:
 
   ```yaml
   service:
@@ -192,8 +211,8 @@ The image is `linux/amd64`. Two paths matter:
       data_dir: /otterstax/data
   ```
 
-- `/otterstax/data` is the data: local tables, the WAL, Kafka offsets, log files. Keep it on a
-  volume or it goes away with the container.
+- `/otterstax/data` holds local tables, the WAL, local Kafka offsets and, by default,
+  log files. The named volume in the command above keeps those files across container replacement.
 
 The config is read once. To apply a change, edit the file and `docker restart otterstax`. On
 `docker stop` the server drains the open sessions (up to 30 s) and writes a final checkpoint,
@@ -203,13 +222,32 @@ any refusal of the config.
 ## Running with Docker Compose
 
 ```bash
+python3 -m pip install Faker
 python3 fixtures/generate_data.py  # test data
 ./scripts/deps-image.sh release    # once: the image with the prebuilt dependencies
 docker compose up                  # databases + server; connections from scripts/database/config.yaml
 ```
 
-`examples/quick_start/` and `examples/demo/` are self-contained stacks with their own READMEs;
-they run the published image, so nothing is compiled.
+This stack builds the server from the current checkout. It publishes Flight SQL (8815),
+the MySQL wire (8816) and the Tracy port (8086, used when built with Tracy).
+The root stack's engine data is in its container, at the path set in
+`scripts/database/config.yaml`. The quick start and demo use the published Linux
+amd64 runtime image. Both publish PostgreSQL on 8817, so run one at a time. See
+`examples/quick_start/README.md` or `examples/demo/CLAUDE.md`.
+
+To use a build from this checkout in either example stack, build the runtime
+image once from the repository root:
+
+```bash
+./scripts/deps-image.sh release
+docker build --build-arg BUILD_JOBS=0 -t otterstax:local .
+```
+
+Use `OTTERSTAX_IMAGE=otterstax:local docker compose up --wait` from the quick start
+directory, or `OTTERSTAX_IMAGE=otterstax:local examples/demo/up.sh` from the
+repository root. To persist the choice, or when Compose runs through sudo, set
+`OTTERSTAX_IMAGE=otterstax:local` in the example directory's Compose environment
+file (`.env`).
 
 ## Testing
 
@@ -217,9 +255,35 @@ they run the published image, so nothing is compiled.
 ./docker-run-tests.sh [-j N] [--tracy | --tracy-sep]
 ```
 
-Builds the test image (its `ctest` step runs the C++ suites), brings up MariaDB / PostgreSQL /
-ClickHouse / RustFS / Kafka, runs the Python integration suite and the PySpark client matrix, then
-tears everything down.
+The runner builds the test image, brings up MariaDB / PostgreSQL / ClickHouse /
+RustFS / Kafka, runs the Python integration suite and PySpark client matrix,
+then tears down the `otterstax-tests` Compose project when it reaches Step 9.
+When building the server image, the runner resolves the release dependency image
+(or the ASAN image for `ENABLE_ASAN=ON`). The normal test image build runs CTest.
+Both Tracy modes skip CTest, and `IMAGE_TAG` uses a prebuilt test server image.
+To verify the C++ suites, run a normal build without Tracy or `IMAGE_TAG`, or run
+`ctest --test-dir build/Release --output-on-failure` after
+building locally with `BUILD_TESTS=ON`.
+
+Before running, the script removes containers and volumes from previous
+runs of that project. The manual stack and its generated host SQL files under
+the root `init` directory are kept. If the manual stack is using port 8086, run
+`docker compose stop` from the repository root to free the port while keeping its
+containers and data. Use `docker compose start` after testing.
+
+An early exit, such as a backend startup timeout, can leave the test stack
+running. Inspect its state and logs from the repository root before retrying:
+
+```bash
+docker compose -p otterstax-tests -f compose.test.yml ps -a
+docker compose -p otterstax-tests -f compose.test.yml logs
+```
+
+When you no longer need the test volumes for diagnosis, remove the test stack:
+
+```bash
+docker compose -p otterstax-tests -f compose.test.yml down --volumes --remove-orphans
+```
 
 | Option | Description |
 | ------ | ----------- |
@@ -228,6 +292,11 @@ tears everything down.
 | `--tracy-sep` | One Tracy profile per test (the server restarts between tests) |
 
 ### Benchmarks
+
+Run the automated benchmark on a disposable Docker environment, with no
+manual benchmark stack and no manual project selected via `COMPOSE_PROJECT_NAME`.
+Each run reloads the benchmark fixtures and removes its Compose containers and
+volumes at exit.
 
 ```bash
 ./benchmark/scripts/run_benchmark.sh [OPTIONS]
@@ -239,9 +308,9 @@ writes `benchmark_results/<timestamp>/`.
 | Option | Description |
 | ------ | ----------- |
 | `--repetitions N` | Repetitions per sub-test (default: 10) |
-| `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
-| `--bench T [T …]` | `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all` (an `external_*` test starts RustFS and registers the `bench_rustfs` alias) |
-| `--rebuild` / `--clear` | Rebuild the images / also drop the DB volumes |
+| `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres arrow` |
+| `--bench T [T …]` | `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all` `kafka_ingest` `kafka_produce` `kafka_stream` (an `external_*` test starts RustFS and registers the `bench_rustfs` alias; a `kafka_*` test starts Redpanda; neither runs over `arrow`) |
+| `--rebuild` / `--clear` | Force image builds / additionally remove images and backend volumes before the run |
 | `-j N` | Parallel build jobs (auto-capped by RAM) |
 | `--tracy` / `--tracy-sep` | Tracy capture, whole run / per test |
 | `--perf` / `--perf-alloc` | `perf` CPU call graph (99 Hz, dwarf) / plus a `malloc` uprobe |

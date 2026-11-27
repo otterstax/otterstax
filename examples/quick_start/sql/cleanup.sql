@@ -1,7 +1,7 @@
--- Reset engine state from a previous run so examples 7-10 can be replayed.
--- Drops the S3-loaded tables and the local schema `qs` (`local.qs`). Backend data
--- (customers/products/orders/pageviews) and the S3 files are untouched.
-DROP TABLE IF EXISTS local.qs.regions;
-DROP TABLE IF EXISTS local.qs.product_costs;
-DROP TABLE IF EXISTS local.qs.promotions;
+-- Full reset of local.qs before replaying examples 6–9: the one CASCADE
+-- statement, as documented in examples/quick_start/README.md. It removes every
+-- object in the schema, including user-created objects, and dependent objects
+-- in other schemas (a view reading a local.qs table is dropped with it).
+-- To remove only the three demo tables, use the three DROP TABLE commands
+-- from the README instead. Backend data and S3 objects are unaffected.
 DROP SCHEMA IF EXISTS qs CASCADE;

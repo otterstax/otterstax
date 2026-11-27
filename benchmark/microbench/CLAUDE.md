@@ -2,13 +2,13 @@
 
 Google Benchmark suite for the hot paths in OtterStax's translation, parsing, and query-generation layers.
 Binary: `build/Release/benchmark/microbench/otterstax_bench`
-Run script: `benchmark/microbench/run-bench.sh` (handles LD_LIBRARY_PATH and JSON repair).
+Run script: `benchmark/microbench/run-bench.sh` (handles the build and LD_LIBRARY_PATH).
 
 ---
 
 ## Source files and what they cover
 
-### `bench_translators.cpp`
+### `benchmark/microbench/bench_translators.cpp`
 
 Data conversion paths between backend wire formats, `data_chunk_t`, and Arrow.
 
@@ -63,12 +63,12 @@ The vector overload is the one called by the MySQL and PostgreSQL wire-protocol 
 | `BM_flight_wire_full_1k` | 1 000 |
 | `BM_flight_wire_full_10k` | 10 000 |
 
-This is the hot path for every query result delivered over the Flight SQL frontend: `chunk_to_record_batch`, then `arrow::ipc::GetRecordBatchPayload` (what `rpc/flight_server.cpp` frames into a DoGet message). The schema is pre-built outside the loop; `ch_to_chunk` runs inside the loop because `data_chunk_t` is not copyable (move-only). **The reported time therefore includes `ch_to_chunk`, the Arrow builder pass and the IPC serialization.** Use `BM_ch_to_chunk_*` to isolate the first.
+This is the hot path for every query result delivered over the Flight SQL frontend: `chunk_to_record_batch`, then `arrow::ipc::GetRecordBatchPayload` (what `frontend/flight_sql/rpc/flight_server.cpp` frames into a DoGet message). The schema is pre-built outside the loop; `ch_to_chunk` runs inside the loop because `data_chunk_t` is not copyable (move-only). **The reported time therefore includes `ch_to_chunk`, the Arrow builder pass and the IPC serialization.** Use `BM_ch_to_chunk_*` to isolate the first.
 
 #### MySQL column-type mapping — no separate benchmark
 
 The MySQL mapping has one table (`to_local_translator`, internal to
-`mysql_to_chunk.cpp`): each arm names both the engine type a column is read as and
+`otterbrix/translators/input/mysql_to_chunk.cpp`): each arm names both the engine type a column is read as and
 the reader that writes its values, so there is no standalone enum → type function
 to measure. It is exercised once per column per query by `mysql_to_chunk` and by
 `tsl::mysql_to_struct`, the schema discovery reads off the same table.
@@ -81,7 +81,7 @@ pinned with; row-level MySQL translation is covered by system tests.
 
 ---
 
-### `bench_file_translators.cpp`
+### `benchmark/microbench/bench_file_translators.cpp`
 
 File-format translators used by the file/S3 ingestion path (`connectors/file`, `integration/s3`).
 
@@ -107,11 +107,11 @@ Input benchmarks use the **buffer** overloads so only the parse + `data_chunk_t`
 
 `chunk_to_*` only expose a file-path API, so output timings **include the filesystem write** to `/tmp`. The source `data_chunk_t` is built once outside the loop (it is move-only, but `chunk_to_*` take it by const ref and so reuse it).
 
-**Arrow runtime note:** the conan cache holds several `libarrow.so` builds; only the one CMake links here ships the CSV/JSON/Parquet readers. `otterstax_bench` therefore pins an absolute `DT_RPATH` to `${CMAKE_BINARY_DIR}/lib` with `--disable-new-dtags` (see `CMakeLists.txt`) so the correct libarrow wins over `run-bench.sh`'s `LD_LIBRARY_PATH` glob.
+**Arrow runtime note:** the conan cache holds several `libarrow.so` builds; only the one CMake links here ships the CSV/JSON/Parquet readers. `otterstax_bench` therefore pins an absolute `DT_RPATH` to `${CMAKE_BINARY_DIR}/lib` with `--disable-new-dtags` (see `CMakeLists.txt`) so the correct libarrow wins over `benchmark/microbench/run-bench.sh`'s `LD_LIBRARY_PATH` glob.
 
 ---
 
-### `bench_arrow_integration.cpp`
+### `benchmark/microbench/bench_arrow_integration.cpp`
 
 The otterbrix Arrow integration of the file / S3 path, each benchmark next to the per-cell
 code it replaced — both run over the same data in the same binary.
@@ -134,7 +134,7 @@ output benchmarks use engine-shaped 1024-row chunks filled through `set_value`, 
 
 ---
 
-### `bench_parser.cpp`
+### `benchmark/microbench/bench_parser.cpp`
 
 SQL parsing.
 
@@ -153,7 +153,7 @@ Each benchmark reuses one `GreenplumParser` instance across iterations (the pars
 
 ---
 
-### `bench_query_gen.cpp`
+### `benchmark/microbench/bench_query_gen.cpp`
 
 SQL generation for the backends, exercised via `sql_gen::generate_query`.
 
@@ -171,7 +171,7 @@ The query block (the aggregate that reads the remote table, with its clauses) is
 
 ---
 
-### `bench_grammar_extension.cpp`
+### `benchmark/microbench/bench_grammar_extension.cpp`
 
 The `s3` / `file` SQL parser extensions (`otterbrix/parser/grammar_extention/{s3,file}`), which teach the
 engine `CREATE EXTERNAL TABLE … WITH (…)` and `COPY (<select>) TO '<location>' WITH (…)`. Two layers are
@@ -204,11 +204,11 @@ The two `*_create` registry benchmarks are dominated by the core-parser-rejectio
 `BM_registry_parse_core_select` is the contrast where the core parser accepts.
 
 **`transform()` is not separately benchmarked:** it is a placeholder that emits a single-row data node (see
-`grammar_extention/CLAUDE.md`); there is no meaningful work to isolate until the real lowering lands.
+`otterbrix/parser/grammar_extention/CLAUDE.md`); there is no meaningful work to isolate until the real lowering lands.
 
 ---
 
-### `bench_kafka_translators.cpp`
+### `benchmark/microbench/bench_kafka_translators.cpp`
 
 The Kafka value-conversion hot paths (`integration/kafka/detail/kafka_reader.cpp`),
 broker-free. These are the per-batch conversions the SOURCE poller and STREAM
@@ -232,26 +232,26 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 | Function | Reason | Covered by |
 |----------|--------|------------|
 | `tsl::mysql_to_chunk` | `boost::mysql::results` requires live wire data | System tests |
-| `tsl::pg_to_chunk` (with rows) | not benchmarked; rows are manufactured only in the unit tests (`pg_result_fixture.cpp`) | Unit + system tests |
+| `tsl::pg_to_chunk` (with rows) | not benchmarked; rows are manufactured only in the unit tests (`tests/unit/translators/pg_result_fixture.cpp`) | Unit + system tests |
 | `chunk_to_record_batch` in isolation | `data_chunk_t` is non-copyable; `ch_to_chunk` is bundled in the loop | `BM_ch_to_chunk_*` for input, `BM_flight_wire_full_*` for combined |
 
 ---
 
 ## Adding a new benchmark
 
-### Translator benchmark (`bench_translators.cpp`)
+### Translator benchmark (`benchmark/microbench/bench_translators.cpp`)
 
 1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, blocks, {})` (the block in a vector, no declared types) to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`datatype_mismatch` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. A declared type (by result position) applies only to a wire column that represents it (see `otterbrix/CLAUDE.md`).
 2. `data_chunk_t` is **non-copyable**. If you need N iterations over the same data, either hold a `clickhouse::Block` outside the loop and call `ch_to_chunk` inside, or redesign to avoid copies.
-3. If the benchmark needs `GreenplumParser` (e.g., testing a path that touches the parser), include `utility/logger.hpp` and add a `LoggerInit` guard as in `bench_parser.cpp` — the parser requires named spdlog loggers to be registered.
+3. If the benchmark needs `GreenplumParser` (e.g., testing a path that touches the parser), include `utility/logger.hpp` and add a `LoggerInit` guard as in `benchmark/microbench/bench_parser.cpp` — the parser requires named spdlog loggers to be registered.
 
-### Parser benchmark (`bench_parser.cpp`)
+### Parser benchmark (`benchmark/microbench/bench_parser.cpp`)
 
 1. Add a new `const char* kMySQL = "..."` fixture in the anonymous namespace.
 2. For `GreenplumParser::parse()` benchmarks: construct one `GreenplumParser` outside the loop (it is stateless and safe to reuse).
 3. Use `std::pmr::unsynchronized_pool_resource pool` outside the loop for the parser's resource; allocations accumulate across iterations without being freed mid-loop (intentional — mirrors production behaviour).
 
-### Query-generation benchmark (`bench_query_gen.cpp`)
+### Query-generation benchmark (`benchmark/microbench/bench_query_gen.cpp`)
 
 1. Add the SQL as a `const char*` fixture: one query block over ONE remote table written with its
    alias (`alias.db.schema.table`), the shape a backend actor's offer hands the generator.
@@ -266,8 +266,8 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 ## Known constraints
 
-**Exit 139 (SIGSEGV at process exit):** The Greenplum SQL parser (`raw_parser()`) has global state that races with spdlog's file-sink destructor on process exit. All benchmarks complete before the crash fires. `run-bench.sh` tolerates exit 139 and repairs truncated JSON automatically. See `benchmark/CLAUDE.md` for details.
+**The binary must exit 0.** A SIGSEGV (exit 139) here is a bug, not a known issue. The historical 139 was a deterministic null dereference at the first `BM_generate_query_*` case: the fixtures named their tables in three parts, which leaves the parsed name's connection slot empty, the block search returned null, and the Release build (asserts compiled out) dereferenced it — the "raw_parser global state races spdlog's file-sink destructor at process exit" explanation was never confirmed and is retired. Fixed by four-part fixtures (`connection.database.schema.table`).
 
-**`assert` is compiled away in Release (`-DNDEBUG`).** The `assert(!parsed.has_error())` / `assert(block.node)` guards in `bench_query_gen.cpp`'s `parse_block` do nothing in the production build. Check a new fixture in a Debug build (or a one-off Catch2 test) first: a statement that does not parse, or whose block names another uid, dereferences null in Release.
+**`assert` is compiled away in Release (`-DNDEBUG`).** The `assert(!parsed.has_error())` / `assert(block.node)` guards in `benchmark/microbench/bench_query_gen.cpp`'s `parse_block` do nothing in the production build. Check a new fixture in a Debug build (or a one-off Catch2 test) first: a statement that does not parse, a table named in three parts (only the four-part spelling fills the connection slot `block_of` matches by uid), or a block naming another uid dereferences null in Release.
 
 **`std::pmr::unsynchronized_pool_resource` accumulates allocations** across benchmark iterations (it only frees on destruction). This is intentional: it matches the production allocation pattern where the pool lives for the lifetime of one query. The pool object must be declared outside the state loop.

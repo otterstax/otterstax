@@ -13,9 +13,10 @@ Kafka DDL and writes, else the engine on the connection's engine session. A
 remote table is an ordinary table of otterbrix's catalog (a table of a
 connection, `uid.ns.t`); otterbrix plans every statement over it and reaches its
 rows through the connection's backend actor (`otterbrix/federation/CLAUDE.md`).
-A statement that misses a table created on the backend after startup registers
-it and runs once more. There is no router and no shared pipeline actor in front
-of it.
+When a statement misses a table created on the backend after startup, the session
+can discover and register it. The statement runs again only if registration
+succeeds, the session is outside a transaction block and the statement can be
+rebuilt. There is no router and no shared pipeline actor in front of it.
 
 ## Files
 
@@ -24,8 +25,9 @@ of it.
 | `query_session.{hpp,cpp}` | The actor, `session_services_t` (everything it sends to) and `make_session_services` (builds it, refusing an empty address), `parameter_row`, `session_ptr` / `session_closer_t`; `command_payload` (a statement that ran without rows — CREATE EXTERNAL TABLE / COPY ... TO, Kafka — under its tag) and `rows_payload` (an engine cursor) anonymous in the `.cpp` |
 | `session_factory.{hpp,cpp}` | `session_factory_t`: opens sessions and holds the ones that exist (`add` / `forget` / `reap` private, `forget` called by the session as it frees itself); its destructor is the sessions' shutdown (drain, `runtime_t::stop_sessions`, reap) |
 | `plan_inspection.{hpp,cpp}` | Pure plan readers: extension root, `transaction_command`, `place_namespace_ddl` (a client's CREATE / DROP DATABASE / SCHEMA into local, or refused), `write_target` (the relation or schema a DDL / DML changes, as written), `setting_changes`, `savepoint_name`, `is_query` (what COPY exports), `statement_names` (every table name as written, for the registration of a missed table) |
-| `session_payload.hpp` | `transaction_command_t`; `session_payload`: schema, chunks, `parameter_count` / `engine_types`, tag, `affected_rows`, `transaction`, `portal` / `has_more`, `setting_changes`, `savepoint`; `reported_rows()` |
-| `session_ids.hpp` | `statement_id_t` (a strong id), `to_hash` |
+| `session/session_payload.hpp` | `transaction_command_t`; `session_payload`: schema, chunks, `parameter_count` / `engine_types`, tag, `affected_rows`, `generated_id` (an INSERT's
+storage-generated id: the MySQL wire's `last_insert_id`), `transaction`, `portal` / `has_more`, `setting_changes`, `savepoint`; `reported_rows()` |
+| `session/session_ids.hpp` | `statement_id_t` (a strong id), `to_hash` |
 
 ## The actor
 
@@ -39,7 +41,7 @@ connection object.
   always answers `needs_sched == false`. A frontend only calls
   `actor_zeta::send(session->address(), &query_session_t::execute, statement_id_t{...}, sql)`
   and awaits the future through `frontend/common/asio_future_bridge.hpp`
-  (Spark: `spark_connect_server/await_future.hpp`). Only an allocation failure
+  (Spark: `frontend/spark_connect_server/await_future.hpp`). Only an allocation failure
   of the pool's job node can make the enqueue throw; `schedule()` is
   `noexcept`, so that terminates. `enqueue_impl` stays `[[nodiscard]]`.
 - **One statement at a time, in arrival order.** A cooperative actor holds ONE
@@ -54,7 +56,7 @@ connection object.
   engine's executor spins the same way on its exec pool). The session keeps the
   plain `co_await` until actor-zeta / otterbrix wake an actor when the future it
   awaits settles. The hidden `[.engine-defect-otb-notify]` case in
-  `test_session_lifetime.cpp` asserts the idle wait.
+  `tests/session/test_session_lifetime.cpp` asserts the idle wait.
 
 ### Entry points
 
@@ -70,6 +72,7 @@ All answer `unique_future<core::result_wrapper_t<session_payload>>`:
 | `fetch_window(portal, count)` / `close_window(portal)` | the next rows of a window (`fetch_all`: every row left) / close a window the client abandoned |
 | `describe_bound(statement_id_t, data_chunk_t, row)` | describe the prepared statement with the values bound (a PostgreSQL Describe of a portal); keeps nothing |
 | `close_statement(statement_id_t)` | forget a prepared statement; idempotent |
+| `use(statement_id_t, std::string named)` | set the session's place (`catalog::client_place`): the PostgreSQL StartupMessage `database`, MySQL `USE` / `COM_INIT_DB`, Spark's current database |
 | `execute_plan(statement_id_t, ParsedQueryDataPtr, rebuild_fn)` | run a pre-built plan (Spark) |
 | `prepare_plan(statement_id_t, ParsedQueryDataPtr, rebuild_fn)` | describe a pre-built plan without running it; keeps nothing |
 | `fail_transaction(core::error_code_t, std::string)` | a failure the frontend found itself (a protocol error, a value it cannot bind, a statement it stopped waiting for): reported to the engine on the connection's session, so it fails an open block; answers the error |
@@ -138,8 +141,8 @@ may go away in the middle of a statement:
 Shutdown order (`main.cpp`, the tests' `session_stack_owner`): the servers,
 declared after the factory, are destroyed first — each stops in its destructor
 and their connections close their sessions. Then `~session_factory_t`:
-`wait_closed(30 s)` for the sessions to drain (a warning names the sessions
-still running and how many are inside a block) → `runtime_t::stop_sessions()`
+`wait_closed(30 s)` for the sessions to drain (a warning counts the sessions
+still running a statement and how many are inside a block) → `runtime_t::stop_sessions()`
 (idempotent; stopping the pool a second time directly would hang) → `reap()`.
 `stop_sessions` must come before `reap`: a pool thread could otherwise resume a
 session `reap` frees. Only then the Kafka / S3 / file actors, the engine and the
@@ -163,7 +166,7 @@ session directly), `s3` (`db::S3Manager`), `file` (`conn::file::FileManager`),
 read under their lock — an INSERT tells a Kafka write by them), and the remote
 connections: `connections` (every configured connection with its backend actor,
 `remote_backends_t::connections()` — what the registration of a missed table
-needs) and `aliases` (the names the ownership guard keeps). A query over remote
+needs). A query over remote
 tables reaches the backends through the engine, never through the session. No
 address may be empty (an actor-zeta send to an empty address dereferences
 null): `make_session_services(resource, engine_dispatcher, s3, file, kafka,
@@ -189,8 +192,11 @@ Each query session owns `engine_session_` (`session_id_t::generate_uid()`).
 Every statement of the connection runs on it — its transaction, its settings,
 its prepared statements and windows — so BEGIN / COMMIT / ROLLBACK and
 SAVEPOINT / RELEASE / ROLLBACK TO work with the engine's PostgreSQL semantics on
-every protocol, over local and remote tables alike (what a block means on a
-backend: `otterbrix/federation/CLAUDE.md`, "Transactions"):
+every protocol that holds one query session across statements (the MySQL and
+PostgreSQL wires, Spark Connect), over local and remote tables alike. Flight SQL
+executes every statement in autocommit and refuses a BEGIN (below): a
+multi-statement block needs a session kept between statements (what a block
+means on a backend: `otterbrix/federation/CLAUDE.md`, "Transactions"):
 
 - **The block is the engine's.** The engine stamps where the session stands on
   every answer, an error included (`cursor_t::transaction_status()`); `follow()`
@@ -296,7 +302,7 @@ one, so `front()` is defined), for a write cursor `affected_rows`, and the
 window's portal. `session_payload::reported_rows()` is the row count of a result
 with columns and `affected_rows` of a column-less one — what the frontends put
 in CommandComplete / the OK packet. A row-producing statement whose result has
-no columns is a `schema_error` naming the statement (`engine::execute_statement`),
+no columns is an `internal_error` naming the statement (`engine::execute_statement`),
 never a column-less payload a frontend would report as a DML.
 
 ### Pre-built plans (`execute_plan` / `prepare_plan`)
@@ -337,12 +343,13 @@ only move the bytes:
   `conn::file::FileManager::load_file` (local); then `engine::create_table_plan`
   of the target as written (up to three parts, completed by the place as any CREATE TABLE:
   the database is not created, a missing schema is the engine's refusal, an
-  existing table `table_already_exists`) and `engine::load_table`: outside a block
-  BEGIN / CREATE / INSERT / COMMIT (the table with its rows or nothing), inside a
-  block two more statements of it; a connection's table (`uid.ns.t`, or a short
-  name in a place that is a connection's database) is created and filled in
-  autocommit — two statements, not atomic — and inside a block as otterbrix's
-  rules for a remote write in a block decide;
+  existing table `table_already_exists`) and `engine::load_table`. A local load
+  outside a block runs BEGIN / CREATE / INSERT / COMMIT (the table with its rows
+  or nothing). Inside a block, CREATE and INSERT both participate in it. A
+  connection's table (`uid.ns.t`, or a short name in a place that is a
+  connection's database) uses separate autocommit statements. A failed INSERT
+  can leave the table in place. A remote load inside a block is refused at CREATE
+  under the engine's remote DDL rules;
 - copy → the inner SQL parsed on the session's own parser; only a query
   (`plan::is_query`: SELECT, VALUES, a set operation) and one without unbound
   parameters is accepted; it runs through `on_engine` (a missed table registered
@@ -380,8 +387,9 @@ Tracy zones are per-thread and strictly nested. A session coroutine resumes afte
 spans a suspension point ends on the wrong thread or out of order and corrupts
 the trace. Every handler therefore opens `OTX_ZONE_N` in a block that closes
 before its first `co_await`; synchronous helpers — `parse_sql`, `parse_bound`,
-`close_statement` (which never suspends), `close()`, `plan::*` — carry their own
-zone as the first statement. The awaited actors measure their own work. This is
+`close_statement` (which never suspends), `close()` — carry their own
+zone as the first statement, as do three plan readers (`plan::place_namespace_ddl`,
+`plan::setting_changes`, `plan::statement_names`). The awaited actors measure their own work. This is
 the coroutine exception to the root `CLAUDE.md` "first statement" rule: only
 `assert`s, objects that must live for the whole coroutine (`Timer`) and the
 variables the block fills (the future to await, held in a `std::optional` when
@@ -400,18 +408,20 @@ at function scope.
 (runtime → remote backends over mock connectors (`mock_connectors()`), the
 configured connections registered → real engine in a temp dir opened with the
 backend actors' map → the S3 / file / Kafka actors → session factory):
-`test_session_pipeline.cpp` (a remote SELECT through the backend and the engine,
+`tests/session/test_session_pipeline.cpp` (a remote SELECT through the backend and the engine,
 failure texts, N parallel connections, in-order completion, the parser boundary,
-the ownership guard), `test_session_prepared.cpp` (reusable entries, a failed
+the ownership guard), `tests/session/test_session_prepared.cpp` (reusable entries, a failed
 execute keeping the entry, values per execute, close, per-connection isolation,
-RETURNING, `describe_bound`, windows), `test_session_registration.cpp` (a missed
+RETURNING, `describe_bound`, windows), `tests/session/test_session_registration.cpp` (a missed
 table registered on every route — execute, prepare, a DataFrame plan, COPY's inner
 query, a short name in a connection's place — and inside a block registered
 without the run once more; COPY's inner statement must be a query),
-`test_session_settings.cpp` (server-wide settings refused on every SQL route, an
-executed SET naming what it assigned), `test_session_external.cpp`,
-`test_session_kafka.cpp`, `test_session_plans.cpp` (`execute_plan` /
-`prepare_plan`), `test_session_subquery.cpp`, and `test_session_lifetime.cpp`:
+`tests/session/test_session_settings.cpp` (server-wide settings refused on every SQL route, an
+executed SET naming what it assigned), `tests/session/test_session_external.cpp`,
+`tests/session/test_session_kafka.cpp`, `tests/session/test_session_plans.cpp` (`execute_plan` /
+`prepare_plan`), `tests/session/test_session_subquery.cpp`, `tests/session/test_session_types.cpp`
+(a prepare announces the type its execute delivers — a table, a view, a placeholder typed by its
+context), and `tests/session/test_session_lifetime.cpp`:
 `make_session_services` setting every address and refusing each empty one, the
 close protocol, ordering across real suspensions, local transactions (ROLLBACK /
 COMMIT, abort until ROLLBACK, two connections isolated), the engine's status on

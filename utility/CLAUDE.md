@@ -22,7 +22,7 @@ future (`actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`)
 returned by a send to their connection's `query_session_t`. The poll-side bridge
 lives at `frontend/common/asio_future_bridge.hpp`.
 
-### `wait_barrier.hpp`
+### `utility/wait_barrier.hpp`
 
 `otterstax::query_result_t` / `as_query_result` / `spawn_marshaled` /
 `run_with_owned_handler` — the single point where a
@@ -30,7 +30,7 @@ connector result crosses from the io_context to its consumer. A live exception
 must never cross it (boost.asio's `use_future` destroys the captured
 `exception_ptr` on the io thread, racing the consumer's `get()`; TSAN race under
 boost 1.88), so failures are marshalled as **values**: `core::error_t` for
-error-only (`asio_error_t`, `asio_error.hpp`) handlers, `core::result_wrapper_t<R>`
+error-only (`asio_error_t`, `utility/asio_error.hpp`) handlers, `core::result_wrapper_t<R>`
 for handlers that return data. The connector's `runQuery` already resolves to that
 outcome type; `spawn_marshaled` forwards it through a `std::promise` held by
 `detail::outcome_promise_t`, a by-value coroutine parameter whose destructor
@@ -52,7 +52,7 @@ temporary or a loop-local lambda. The futures `spawn_marshaled` answers do not b
 on destruction (unlike `std::async`): a caller whose handler captures its frame by
 reference waits on the future before that frame ends.
 
-### `function_ref.hpp`
+### `utility/function_ref.hpp`
 
 `otterstax::function_ref_t<R(Args...)>` — a non-owning, non-allocating reference to a
 callable: its address plus a trampoline typed on the callable. It is how a handler
@@ -63,7 +63,7 @@ through it. It binds only a named, non-const object, so a temporary does not com
 Production binds it in one place, `run_with_owned_handler` (above), to the handler copy
 in that coroutine's frame.
 
-### `parse_port.hpp`
+### `utility/parse_port.hpp`
 
 `otterstax::parse_port(text, resource)` — the config `port` string →
 `core::result_wrapper_t<uint16_t>`; digits only, 1..65535, otherwise
@@ -71,43 +71,45 @@ in that coroutine's frame.
 (`config/connections/connection_config_reader.cpp`) and by
 `remote_backends_t::open` when it builds the connectors' params.
 
-### `session.hpp`
+### `utility/session.hpp`
 
 `session_hash_t` — the per-call id (`session::to_hash` of a query session's statement id) the
 file / s3 managers and Kafka take. Nothing else lives there: an engine
 session is `components::session::session_id_t`, included where it is used.
 
-### `thread_pool_manager.hpp`
+### `utility/thread_pool_manager.hpp`
 
 `thread_pool_manager` — a `boost::asio::io_context` + the `std::thread`s that run it, sized by its
 owner (no default). The wire-protocol frontend servers' asio pools (`frontend/common/frontend_server.hpp`,
 `service.runtime.{mysql,postgres}_io`); the connector tests run their connectors' io_context on one.
 
-### `asio_error.hpp`
+### `utility/asio_error.hpp`
 
 `otterstax::asio_error_t` — the return type of an error-only connector handler (the outcome IS the
 error, no payload); `query_result_t` keys off it to marshal a bare `core::error_t`.
 
-### `table_info.hpp`
+### `utility/table_info.hpp`
 
 `table_info` — a table's `qualified_name_t` and its STRUCT schema (`catalog/discovery.hpp`, the Flight SQL
 core).
 
-### `tracy_memory_resource.hpp`
+### `utility/tracy_memory_resource.hpp`
 
 A PMR interposer that reports every upstream slab to Tracy under a named pool (the parser's arena, the
 MySQL / PostgreSQL packet processing). It must outlive every container built over it; the name must
 be a string literal.
 
-### `logger.hpp`
+### `utility/logger.hpp`
 
 `log_t` and `initialize_all_loggers()` — spdlog wrappers. Log level is compile-time via `SPDLOG_ACTIVE_LEVEL` (default `ERROR`; override with `-DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG`).
 
-### `tsan_helper.hpp`
+### `utility/tsan_helper.hpp`
 
-TSAN annotation helpers (`ANNOTATE_HAPPENS_BEFORE` / `ANNOTATE_HAPPENS_AFTER`). Used to suppress false positives when actor message delivery provides implicit synchronization that TSAN cannot observe.
+A compile-time detector for ThreadSanitizer (`HAS_TSAN` / `TSAN_ENABLED`, from
+`__has_feature(thread_sanitizer)` or `__SANITIZE_THREAD__`); code that must behave
+differently under TSAN reads it (`tests/unit/utility/test_asio_future_bridge.cpp` does).
 
-### `tracy_profiler.hpp`
+### `utility/tracy_profiler.hpp`
 
 Wraps the Tracy macros so they compile to no-ops when Tracy is disabled (the
 default). Provides `OTX_ZONE()`, `OTX_ZONE_N("Scope::function")`, `OTX_FRAME()`,
@@ -115,10 +117,11 @@ default). Provides `OTX_ZONE()`, `OTX_ZONE_N("Scope::function")`, `OTX_FRAME()`,
 Every actor handler and expensive standalone function carries an `OTX_ZONE_N`
 as its first statement — see the root `CLAUDE.md` Tracy section for the rule.
 
-### `timer.hpp`
+### `utility/timer.hpp`
 
-`Timer` — RAII helper that logs `"<scope> took N µs"` at destruction through
-the provided `log_t`. Used by the `query_session_t` entry points
+`Timer` — RAII helper that logs `Timer [<scope>]: Total Time elapsed = <N> ms`
+at destruction through the provided `log_t` (trace level; `timePoint` logs an
+intermediate one, same format). Used by the `query_session_t` entry points
 (`execute`, `execute_prepared_statement`, `prepare_schema`, `execute_plan`,
-`prepare_plan`) to get free per-query timings in DEBUG builds.
+`prepare_plan`) for per-query timings when the log level shows trace.
 

@@ -61,6 +61,9 @@ Usage: ./benchmark/scripts/run_benchmark.sh [OPTIONS]
 
 Run the OtterStax benchmark suite end-to-end inside Docker.
 Both Docker images are reused automatically when they already exist.
+Use a disposable Docker environment without a manual benchmark stack and leave
+COMPOSE_PROJECT_NAME unset. Every run reloads benchmark fixtures and removes
+its Compose containers and volumes at exit.
 
 Options:
   --repetitions N     Repetitions per sub-test query (default: 10)
@@ -86,8 +89,8 @@ Options:
 Build control:
   --rebuild           Rebuild both Docker images even if they already exist.
                       Use after changing otterstax_app C++ source or bench.yaml.
-  --clear             Full reset: remove images + all backend DB volumes, then
-                      build and run everything from scratch. Implies --rebuild.
+  --clear             Also remove images and backend volumes before the run.
+                      Implies --rebuild.
   -j N                Parallel cmake jobs for the otterstax_app build.
                       Default: min(nCPU, floor(dockerRAM_MB / 1536)) — auto-capped
                       so each job has ~1.5 GB. Override when you know your limits.

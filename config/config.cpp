@@ -220,18 +220,22 @@ namespace {
             return unknown;
         }
         EngineConfig engine;
-        const std::array<std::pair<const char*, std::string*>, 2> directories{{
-            {"data_dir", &engine.data_dir},
-            {"log_dir", &engine.log_dir},
-        }};
-        for (const auto& [key, target] : directories) {
-            if (config[key]) {
-                auto dir = directory(config[key], std::string("service.engine.") + key, resource);
-                if (dir.has_error()) {
-                    return dir.convert_error<EngineConfig>();
-                }
-                *target = std::move(dir.value());
+        if (config["data_dir"]) {
+            auto dir = directory(config["data_dir"], "service.engine.data_dir", resource);
+            if (dir.has_error()) {
+                return dir.convert_error<EngineConfig>();
             }
+            engine.data_dir = std::move(dir.value());
+        }
+        // log_dir reads as plain text: "" is the key not set — the logs go to
+        // data_dir (config::log_directory), the form the documented example
+        // config writes. A non-scalar stays yaml_scalar's to refuse.
+        if (config["log_dir"]) {
+            auto dir = yaml_scalar<std::string>(config["log_dir"], "service.engine.log_dir", resource);
+            if (dir.has_error()) {
+                return dir.convert_error<EngineConfig>();
+            }
+            engine.log_dir = std::move(dir.value());
         }
         return engine;
     }

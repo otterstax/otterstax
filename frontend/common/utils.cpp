@@ -123,12 +123,7 @@ namespace frontend {
                     return postgres::field_type::TEXT;
                 case components::types::logical_type::DECIMAL:
                 case components::types::logical_type::HUGEINT:
-                    // NUMERIC (oid 1700). PostgreSQL has no 128-bit integer
-                    // either, and NUMERIC carries every value of one exactly, so
-                    // a HUGEINT rides it with nothing after the point. The type
-                    // is mapped for both formats, but only the text one has an
-                    // encoder: is_encodable<POSTGRES> refuses the column in
-                    // binary (see resultset_utils.cpp).
+                    // NUMERIC carries HUGEINT exactly at scale zero in text and binary.
                     return postgres::field_type::NUMERIC;
                 case components::types::logical_type::DATE:
                     return postgres::field_type::DATE;

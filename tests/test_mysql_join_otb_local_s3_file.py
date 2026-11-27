@@ -7,9 +7,8 @@
 # shape so a regression on either side is caught by a fast python check before
 # the benchmark suite runs.
 #
-# All three keys are int64 (parquet/csv loaders emit int64; `weights.campaign_id`
-# is declared bigint) to sidestep the silent zero-row JOIN trap documented in
-# tests/CLAUDE.md, "JOIN-key width sensitivity".
+# All three keys are int64: parquet/csv loaders emit int64 and
+# `weights.campaign_id` is declared bigint.
 
 import sys
 
@@ -66,9 +65,7 @@ def run(local=False):
         events_total = int(_scalar(cur, f"select count(*) from {INTERNAL_DB}.web_events"))
 
         # ── 3. weights — plain CREATE TABLE + INSERT VALUES ─────────────────
-        # bigint matches the int64 the parquet/csv loaders expose, so the
-        # equi-JOIN doesn't silently drop rows (tests/CLAUDE.md, "JOIN-key
-        # width sensitivity").
+        # Use bigint to match the fixture column types.
         cur.execute(
             f"CREATE TABLE {INTERNAL_DB}.weights ("
             f"  campaign_id bigint,"

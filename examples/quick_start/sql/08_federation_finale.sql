@@ -1,4 +1,4 @@
--- Example 9: Federation finale — all four live backends + an S3-loaded engine
+-- Example 8: Federation finale — all four live backends + an S3-loaded engine
 -- table in a single statement:
 --   orders (MariaDB) ⋈ customers (PostgreSQL #1) ⋈ products (PostgreSQL #2)
 --   ⋈ pageviews (ClickHouse) ⋈ product_costs (S3 parquet, loaded in example 6).

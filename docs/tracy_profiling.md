@@ -28,9 +28,11 @@ All instrumentation uses the `OTX_` wrappers defined in `utility/tracy_profiler.
 ### devcontainer / local build
 
 ```bash
-conan install . --build=missing -s build_type=Release -o "&:with_tracy=True"
-cmake --preset conan-release
-cmake --build build/Release --target server -j$(nproc)
+conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20 \
+  -o "&:with_tracy=True"
+cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+cmake --build build/Release --target server --parallel <JOBS>   # size <JOBS> to RAM (root CLAUDE.md)
 ```
 
 Verify Tracy symbols are present:
@@ -41,20 +43,26 @@ nm build/Release/server | grep -i tracy | head -5
 
 ### Docker (main image)
 
+Resolve the release dependency image before building with Tracy:
+
 ```bash
+./scripts/deps-image.sh release
 WITH_TRACY=true docker compose up --build
 ```
 
-Or build the image directly:
+The default Dockerfile target is the runtime image. Use the host capture CLI
+with that image, or build the `builder` target to get `tracy-capture`:
 
 ```bash
-docker build --build-arg WITH_TRACY=true -t otterstax:tracy .
+docker build --target builder --build-arg DEPS_IMAGE="$(./scripts/deps-image.sh release)" \
+  --build-arg WITH_TRACY=true -t otterstax:tracy-builder .
 ```
 
 ### Integration test image
 
 ```bash
-WITH_TRACY=true docker compose -f compose.test.yml build test-otterstax
+DEPS_IMAGE="$(./scripts/deps-image.sh release)" WITH_TRACY=true \
+  docker compose -f compose.test.yml build test-otterstax
 ```
 
 ## Connecting the Tracy GUI
@@ -66,7 +74,7 @@ WITH_TRACY=true docker compose -f compose.test.yml build test-otterstax
 **devcontainer users:** VS Code must forward port 8086 to your host.
 
 - Open the **Ports** panel → click **Forward a Port** → enter `8086`.
-- `forwardPorts: [8086]` in `devcontainer.json` does this automatically on container rebuild.
+- `forwardPorts: [8086]` in `.devcontainer/devcontainer.json` does this automatically on container rebuild.
 
 ## Saving a trace without the GUI
 
@@ -98,14 +106,16 @@ Open the saved file later in the GUI: **File → Open → trace.tracy**
 
 | Step | Action |
 | --- | --- |
-| 1 | Tears down any previous containers and volumes (`compose down --volumes`) |
-| 2 | Rebuilds Docker images (`test-otterstax`, `test-client`) |
-| 3 | Starts all four databases (MariaDB ×2, PostgreSQL, ClickHouse) |
-| 4–6 | Waits for each DB to be healthy, creates test data, verifies tables |
+| 1 | Removes previous containers and volumes in the `otterstax-tests` project, then rebuilds the test images |
+| 2–3 | Starts the databases and stores (MariaDB ×2, PostgreSQL, ClickHouse, redpanda for Kafka, RustFS), then waits for each to be healthy |
+| 4–6 | Creates the test data, verifies it, checks specific tables |
 | 7 | Starts `test-otterstax`, waits for its FlightSQL wire port (8815) to accept connections |
-| 7b | *(Tracy only)* starts `tracy-capture` in background on the host |
-| 8 | Runs the test suite inside `test-client` |
-| 8b | *(Tracy only)* stops `tracy-capture`, flushes and reports file path |
+| 7b | *(`--tracy`)* starts the `tracy-capture` sidecar in the test network |
+| 8 | Runs the main test suite inside `test-client` |
+| 8a | FlightSQL end-to-end against the original drivers |
+| 8c | Kafka crash-recovery (exactly-once through `kill -9`) — plain suite only, skipped under Tracy / ASAN / TSAN |
+| 8d | Spark Connect client matrix (20 PySpark versions) |
+| 8b | *(`--tracy`)* stops OtterStax first and waits for the capture to write its profile |
 | 9 | Tears everything down again |
 
 ### Environment variables
@@ -138,14 +148,15 @@ Understanding each step helps when things go wrong or when you want a different 
             mkdir -p <TRACY_OUTPUT_DIR>
 ```
 
-A shell `trap` on `EXIT / INT / TERM` is registered immediately. It kills
-`tracy-capture` and prints the file path no matter how the script exits —
-including Ctrl+C or a test failure.
+A shell trap handles `EXIT`, `INT` and `TERM`. If a capture is active, it
+stops OtterStax, allows up to 10 seconds for the capture to finish, and removes
+the capture container. It reports the profile path if the file was written.
 
 #### Build step
 
 `ENABLE_TRACY=true` causes the script to `export WITH_TRACY=true` before
-calling `docker compose build`. Docker Compose reads that env var as the
+calling `docker compose build`. The runner resolves the dependency image when
+it builds the test server. Docker Compose reads `WITH_TRACY` as the
 `WITH_TRACY` build arg (declared in `compose.test.yml`), which triggers:
 
 1. `conan install` with `-o "&:with_tracy=True"` → fetches `tracy/0.13.1`
@@ -154,25 +165,19 @@ calling `docker compose build`. Docker Compose reads that env var as the
 
 #### Capture step (Step 7b — after otterstax is healthy)
 
-```bash
-TRACY_PORT=$(compose port test-otterstax 8086 | cut -d: -f2)
-tracy-capture -a localhost -p "$TRACY_PORT" -o "$TRACY_FILE" -f &
-TRACY_CAPTURE_PID=$!
-```
-
-- `compose port` resolves the actual host-side port (handles non-default mappings).
-- `-f` tells `tracy-capture` to overwrite the output file if it already exists.
-- The process runs in the background (`&`) while tests execute.
-- If `tracy-capture` exits within 2 seconds it is assumed to have failed
-  (port not reachable) and a warning is printed — the test run still continues.
-- If `tracy-capture` is **not found on PATH** the script prints a warning and
-  skips auto-capture. The server is still Tracy-enabled; you can attach the GUI
-  manually (see below).
+The script runs the image's `tracy-capture` binary in a background container on
+the `otterstax-tests_test_app_network` network. The capture connects to
+`test-otterstax:8086` and writes `otterstax.tracy` into the run's mounted
+profile directory. If the capture container exits during the first two seconds,
+the script prints its logs and continues the tests.
 
 #### Stop step (Step 8b — after tests finish)
 
-`SIGTERM` is sent to the `tracy-capture` process, then the script waits for it
-to flush its buffer and close the file before reporting the path.
+The script stops OtterStax first. The resulting TCP disconnect lets
+`tracy-capture` finalize the profile. The script waits up to 30 seconds before
+stopping a capture container that is still running, then prints the capture logs
+and reports the file if it exists. A direct `SIGTERM` can interrupt profile
+writing.
 
 ### Live view without saving a file
 
@@ -181,7 +186,8 @@ and start the server directly:
 
 ```bash
 # Terminal 1 — build and run with Tracy but no auto-capture
-WITH_TRACY=true docker compose -f compose.test.yml up --build test-otterstax
+DEPS_IMAGE="$(./scripts/deps-image.sh release)" WITH_TRACY=true \
+  docker compose -f compose.test.yml up --build test-otterstax
 
 # Terminal 2 — open Tracy GUI and connect to localhost:8086
 ```
@@ -200,6 +206,7 @@ If you just want to capture a trace against a running server (no test orchestrat
 
 ```bash
 # 1. Start the stack with Tracy
+./scripts/deps-image.sh release
 WITH_TRACY=true docker compose up --build
 
 # 2. In a separate terminal, capture for N seconds
@@ -215,8 +222,8 @@ Omit `-s` to capture indefinitely.
 You can also run just the integration test server and capture independently:
 
 ```bash
-# Terminal 1 — start only the server (and its DB dependencies)
-WITH_TRACY=true docker compose -f compose.test.yml up test-otterstax
+# Terminal 1 — start a previously built Tracy test server (and its DB dependencies)
+docker compose -f compose.test.yml up test-otterstax
 
 # Terminal 2 — capture while you drive traffic manually or run specific tests
 tracy-capture -a localhost -p 8086 -o focused.tracy -f

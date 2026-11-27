@@ -4,9 +4,9 @@
 
 Three independent benchmark systems:
 
-- **`microbench/`** — Google Benchmark C++ microbenchmarks for translation, parsing, and schema hot paths. No Docker required; runs locally against the build tree.
-- **`scripts/run_benchmark.sh` + `benchmarks/`** — End-to-end query latency harness. Measures single-connection latency across MySQL wire, PostgreSQL wire, and Arrow/FlightSQL frontends.
-- **`stress/run_stress_benchmarks.sh` + `stress/`** — Concurrent load stress test. Runs many parallel connections across three escalating stages and produces a degradation report (throughput, latency percentiles, error rate).
+- **`benchmark/microbench/`** — Google Benchmark C++ microbenchmarks for translation, parsing, and schema hot paths. No Docker required; runs locally against the build tree.
+- **`benchmark/scripts/run_benchmark.sh` + `benchmark/benchmarks/`** — End-to-end query latency harness. Measures single-connection latency across MySQL wire, PostgreSQL wire, and Arrow/FlightSQL frontends.
+- **`benchmark/stress/run_stress_benchmarks.sh` + `benchmark/stress/`** — Concurrent load stress test. Runs many parallel connections across three escalating stages and produces a degradation report (throughput, latency percentiles, error rate).
 
 ---
 
@@ -28,9 +28,9 @@ Three independent benchmark systems:
 Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 
 - `bench_output.txt` — full console output with human-readable table
-- `bench_results.json` — Google Benchmark JSON (repaired automatically if truncated by exit crash)
+- `bench_results.json` — Google Benchmark JSON
 
-### CLI reference (`run-bench.sh`)
+### CLI reference (`benchmark/microbench/run-bench.sh`)
 
 ```text
 --repetitions N   Reps per benchmark (default: 5)
@@ -44,27 +44,34 @@ Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 ### How to build manually (without the script)
 
 ```bash
-cmake -S . -B build/Release -DBUILD_BENCHMARKS=ON \
+cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCHMARKS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 cmake --build build/Release --parallel 5 --target otterstax_bench
 
-# LD_LIBRARY_PATH must include all conan lib dirs (handled automatically by run-bench.sh)
-LD_LIBRARY_PATH=$(find /conan/.conan2/p/b/*/p/lib -maxdepth 0 | tr '\n' ':') \
-  ./build/Release/benchmark/microbench/otterstax_bench --benchmark_filter="BM_ch"
+./build/Release/benchmark/microbench/otterstax_bench --benchmark_filter="BM_ch"
 ```
 
-### Known issue: exit crash (SIGSEGV, exit 139)
+The microbenchmark binary finds the Conan libraries staged in the build's
+`lib` directory through its RPATH.
 
-The PostgreSQL raw_parser (`raw_parser()` from the Greenplum SQL parser) has global
-state that is cleaned up during process exit in a way that races with spdlog's file-sink
-destructor. All benchmarks complete before the crash fires. `run-bench.sh` tolerates
-exit code 139 and repairs the truncated JSON automatically.
+### Historical note: "exit crash" (SIGSEGV, exit 139) was never an exit crash
+
+The benchmarks used to die with SIGSEGV, and an earlier note explained it as a race between
+the Greenplum `raw_parser()` global state and spdlog's file-sink destructor at process exit,
+with every benchmark completing first. That explanation was wrong. The crash was a
+deterministic null dereference at the first `BM_generate_query_*` benchmark — the fixtures
+named their tables in three parts, which leaves the parsed name's connection slot empty, so
+the block search returned null and the Release build (asserts compiled out) dereferenced it.
+The three query-generation benchmarks had never produced a measurement. Fixed by writing the
+fixtures in four parts (`connection.database.schema.table`); the suite now exits 0 and
+`benchmark/microbench/run-bench.sh` fails on any nonzero exit. See `benchmark/microbench/CLAUDE.md`, "Known
+constraints", for the fixture rule.
 
 ### Adding a new microbenchmark
 
 1. Add `BM_*` functions to an existing file in `benchmark/microbench/` or create a new `.cpp` file.
 2. Register new `.cpp` files in `benchmark/microbench/CMakeLists.txt` under `add_executable(otterstax_bench ...)`.
-3. If the benchmark uses `GreenplumParser`, ensure `logger_init` (the static `LoggerInit` in `bench_parser.cpp`) is already linked in — the parser requires named spdlog loggers to be registered before construction.
+3. If the benchmark uses `GreenplumParser`, ensure `logger_init` (the static `LoggerInit` in `benchmark/microbench/bench_parser.cpp`) is already linked in — the parser requires named spdlog loggers to be registered before construction.
 
 ---
 
@@ -74,9 +81,14 @@ An end-to-end benchmark harness for OtterStax. It measures query latency across 
 frontends by default (MySQL wire, PostgreSQL wire and Arrow/FlightSQL) and five test
 categories. Arrow has scripts for those five only: an `external_*` / `kafka_*` test
 selected with `--bench` is skipped for it (`SKIP:` in the log, counted in the final
-line), since there is no `benchmarks/arrow/<test>.py`.
+line), since there is no `benchmark/benchmarks/arrow/<test>.py`.
 
 ## End-to-end quick start
+
+Use a disposable Docker environment without a manual benchmark stack. Leave
+`COMPOSE_PROJECT_NAME` unset in the shell and Compose environment so it
+doesn't select a manual project such as `bench`. Every automated run
+reloads the fixtures and removes its Compose containers and volumes at exit.
 
 ```bash
 # Normal run — images are reused automatically if they already exist
@@ -85,7 +97,7 @@ line), since there is no `benchmarks/arrow/<test>.py`.
 # Full clean slate: wipe images + DB volumes, build and run from scratch
 ./benchmark/scripts/run_benchmark.sh --clear
 
-# Rebuild images only (keeps existing DB volumes / data)
+# Force image builds, then run the usual fixture load and teardown
 ./benchmark/scripts/run_benchmark.sh --rebuild
 
 # Single frontend
@@ -116,16 +128,17 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
                     Values: simple_select complex_select join_same_instance
                             join_cross_engine join_all
                             external_load external_join external_dump
-                            kafka_ingest
+                            external_join_cross external_join_all
+                            kafka_ingest kafka_produce kafka_stream
                     external_* (s3/file) are opt-in: selecting any of them
                     auto-starts RustFS, generates fixtures, registers the
                     bench_rustfs s3 alias. mysql/postgres frontends only.
-                    kafka_ingest is opt-in too: it auto-starts a redpanda broker,
-                    generates a JSON dataset, and seeds it into a topic. No REST
+                    kafka_* are opt-in too: they auto-start a redpanda broker
+                    and share one seeded JSON dataset and topic. No REST
                     registration (the broker is named in CREATE SOURCE directly).
 --out-dir DIR       Result root (default: benchmark_results/<timestamp>)
 --rebuild           Force image rebuild even if images exist
---clear             Remove images + DB volumes, then rebuild from scratch
+--clear             Also remove images and backend volumes before the run
 -j N                Parallel build jobs for otterstax_app
 --tracy             Continuous Tracy capture → <out-dir>/benchmark.tracy
 --tracy-sep         Per-test Tracy capture → <out-dir>/<frontend>_<test>.tracy
@@ -170,7 +183,7 @@ After the script exits, all ports are published to the host:
 | FlightSQL/Arrow  | `localhost:8815`   |
 
 Connections are read from `benchmark/config.yaml` at server startup (mounted
-into `bench_otterstax` by `compose_benchmark.yml`) — there is no HTTP conn API.
+into `bench_otterstax` by `benchmark/compose_benchmark.yml`) — there is no HTTP conn API.
 
 Open Tracy and connect to `localhost:8086` at any time while the service is running.
 
@@ -189,7 +202,7 @@ Results land in `benchmark_manual/<YYYYMMDD_HHMMSS>/`.
 ### Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/my.sql
+echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/my.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/my.sql
 ```
 
@@ -202,7 +215,7 @@ Results are printed as a table and saved to `benchmark_manual/<ts>/summary.md` a
 ./benchmark/manual/stop_service.sh --clean   # stops + wipes all volumes
 ```
 
-If a `--perf` or `--perf-alloc` session was active, `stop_service.sh` automatically:
+If a `--perf` or `--perf-alloc` session was active, `benchmark/manual/stop_service.sh` automatically:
 
 1. Sends INT to perf (lets it write the data footer cleanly)
 2. Copies `/tmp/benchmark.perf.data` from the container to `benchmark_manual/<ts>/`
@@ -221,7 +234,7 @@ benchmark_manual/<YYYYMMDD_HHMMSS>/
     └── <test>.json         # machine-readable stats (same as automated run)
 ```
 
-For **`run_query.sh`** (custom SQL), results land in a separate timestamped dir:
+For **`benchmark/manual/run_query.sh`** (custom SQL), results land in a separate timestamped dir:
 
 ```text
 benchmark_manual/<YYYYMMDD_HHMMSS>/
@@ -242,9 +255,10 @@ benchmark/
 ├── CLAUDE.md                    # This file
 ├── compose_backends.yml         # 6 DB containers (bench_net)
 ├── compose_benchmark.yml        # OtterStax container; publishes :8086 to host
+├── compose_benchmark_perf.yml   # --perf overlay: SYS_ADMIN/PERFMON caps, seccomp off (run_benchmark.sh --perf)
 ├── compose_manual.yml           # Overlay: also publishes 8815/8816/8817 to host
 ├── compose_rustfs.yml           # Overlay: RustFS + seed job for external_* tests
-├── compose_kafka.yml            # Overlay: redpanda broker for kafka_ingest (seed is a run_benchmark.sh step, not a service)
+├── compose_kafka.yml            # Overlay: redpanda broker for kafka_* (seed is a run_benchmark.sh step, not a service)
 ├── Dockerfile.benchmark         # Python image: data init + benchmark scripts (+ confluent-kafka)
 ├── data/
 │   ├── init_data.py             # Creates tables and inserts Faker data in all 6 DBs
@@ -281,7 +295,7 @@ benchmark/
     └── generate_summary.py      # Post-run: regenerate summaries from JSON
 ```
 
-## Data layout (`bench.yaml`)
+## Data layout (`benchmark/bench.yaml`)
 
 Two independent database groups sharing `campaign_id` 1–1000:
 
@@ -297,8 +311,8 @@ The `external:` block sizes the s3/file fixtures (see "External-table tests"
 below); it shares the same `campaign_id` space as Group A but its data lives in
 generated files, not the DB backends.
 
-Changing `bench.yaml` requires rebuilding the client image (`--rebuild` or `--clear`)
-because `bench.yaml` is baked into the image at build time. (External fixtures
+Changing `benchmark/bench.yaml` requires rebuilding the client image (`--rebuild` or `--clear`)
+because `benchmark/bench.yaml` is baked into the image at build time. (External fixtures
 are the exception — they are bind-mounted, so editing `external:` only requires
 re-running an `external_*` benchmark, which regenerates them.)
 
@@ -339,22 +353,20 @@ breakdown.
 Every workload names its tables `bench_ext_<workload>_<frontend>.<table>`: a
 two-part name, the schema of the session's database (`main`), which the runner
 creates first (`CREATE SCHEMA IF NOT EXISTS`, `_ensure_schema` in
-`benchmarks/external_common.py`) — CREATE TABLE / CREATE EXTERNAL TABLE never
+`benchmark/benchmarks/external_common.py`) — CREATE TABLE / CREATE EXTERNAL TABLE never
 create a schema or a database.
 
-`external_join_cross` / `external_join_all` deliberately load every side into
-otterbrix-internal storage first (external load + a hand-built `bigint` engine
-table). A direct backend.campaign_id (int32) ⋈ s3.campaign_id (int64) silently
-returns zero rows (the JOIN-key width trap: `tests/CLAUDE.md`, "JOIN-key width sensitivity"),
-so the benchmarks follow the staged shape the tests use. `weights` covers
+`external_join_cross` / `external_join_all` measure JOINs after loading every side into
+otterbrix-internal storage (external load + a hand-built `bigint` engine
+table). They follow the staged shape used by the tests. `weights` covers
 campaign_id 1..min(200, max) — bounded join cardinality regardless of fixture
 scale.
 
-Selecting any `external_*` test makes `run_benchmark.sh`:
+Selecting any `external_*` test makes `benchmark/scripts/run_benchmark.sh`:
 
-1. Generate fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`
+1. Generate fixtures into `benchmark/data/fixtures/` via `benchmark/data/generate_external_fixtures.py`
    (a container run of `benchmark-client`, before the stack comes up).
-2. Add `compose_rustfs.yml` to the backend + otterstax compose sets (RustFS +
+2. Add `benchmark/compose_rustfs.yml` to the backend + otterstax compose sets (RustFS +
    a one-shot that seeds `bench-bucket` from the same fixtures).
 
 The `bench_rustfs` s3 alias itself is declared in `benchmark/config.yaml`
@@ -362,7 +374,7 @@ The `bench_rustfs` s3 alias itself is declared in `benchmark/config.yaml`
 no runtime registration step.
 
 The `file` and `s3` sources read the **identical** fixtures: bench-otterstax
-mounts `data/fixtures` at `/fixtures`, and RustFS is seeded from the same dir.
+mounts `benchmark/data/fixtures` at `/fixtures`, and RustFS is seeded from the same dir.
 
 ```bash
 # All five external tests, mysql + postgres (arrow is skipped: no arrow script)
@@ -383,10 +395,10 @@ then select the tests:
   --bench external_load external_join external_dump external_join_cross external_join_all
 ```
 
-### External fixtures (`data/generate_external_fixtures.py`)
+### External fixtures (`benchmark/data/generate_external_fixtures.py`)
 
 Benchmark-scale sibling of `tests/s3/fixtures/generate_external_fixtures.py`,
-sized from the `external:` block in `bench.yaml`. `num_campaigns` defaults to
+sized from the `external:` block in `benchmark/bench.yaml`. `num_campaigns` defaults to
 `group_a`, so the fixtures share the backend `campaign_id` space (they could
 JOIN the backends, but the benchmarks deliberately keep joins internal).
 
@@ -396,10 +408,9 @@ JOIN the backends, but the benchmarks deliberately keep joins internal).
 | `web_events.csv`  | csv     | `num_campaigns × events_per_campaign`  | event_id, campaign_id, product_id, event_type, session_seconds, value |
 | `campaigns.ndjson`| ndjson  | `num_campaigns`                        | campaign_id, campaign_name, budget, status |
 
-`regions ⋈ web_events` keys on int64 `campaign_id` on both sides — no width
-mismatch (the silent zero-row JOIN trap when int32 meets int64). Defaults:
+`regions ⋈ web_events` uses an int64 `campaign_id` on both sides. Defaults:
 `regions_per_campaign=4`, `events_per_campaign=20` → ~4 k / ~20 k rows and an
-~80 k-row internal join. Editing `bench.yaml` requires regenerating fixtures
+~80 k-row internal join. Editing `benchmark/bench.yaml` requires regenerating fixtures
 (automatic on the next external run; the `benchmark-client` image is unaffected
 because fixtures are bind-mounted, not baked in).
 
@@ -431,31 +442,31 @@ topic is seeded at bring-up the way the s3 bucket is).
 ./benchmark/manual/run_bench.sh --bench kafka_ingest kafka_produce kafka_stream
 ```
 
-Selecting any `kafka_*` test makes `run_benchmark.sh`:
+Selecting any `kafka_*` test makes `benchmark/scripts/run_benchmark.sh`:
 
 1. Generate the JSON dataset into `benchmark/data/fixtures/kafka_events.ndjson`
-   via `data/generate_kafka_fixtures.py` (Step 1c, sized from `bench.yaml` `kafka:`).
-2. Add `compose_kafka.yml` (the `bench_kafka` redpanda broker) to the backend +
+   via `benchmark/data/generate_kafka_fixtures.py` (Step 1c, sized from `benchmark/bench.yaml` `kafka:`).
+2. Add `benchmark/compose_kafka.yml` (the `bench_kafka` redpanda broker) to the backend +
    otterstax compose sets, and wait for it healthy.
-3. Seed the topic **once** with `data/seed_kafka.py` (Step 3b, an explicit
+3. Seed the topic **once** with `benchmark/data/seed_kafka.py` (Step 3b, an explicit
    `docker run` — NOT a compose one-shot, so `_ensure_otterstax`'s backend `up -d`
    on a mid-run restart can't re-produce and double the topic; Kafka produce is
    not idempotent, unlike the RustFS seed's `aws s3 cp`).
 
-The runner (`benchmarks/kafka_common.py`, driven by the thin
-`benchmarks/{mysql,postgres}/kafka_{ingest,produce,stream}.py`) issues SQL to
+The runner (`benchmark/benchmarks/kafka_common.py`, driven by the thin
+`benchmark/benchmarks/{mysql,postgres}/kafka_{ingest,produce,stream}.py`) issues SQL to
 OtterStax over the wire; `kafka_stream` additionally drains the output topic to
 count rows. Every Kafka statement is built by a `sql_*` helper at the top of
-`kafka_common.py`. The broker address OtterStax uses is embedded in
+`benchmark/benchmarks/kafka_common.py`. The broker address OtterStax uses is embedded in
 `CREATE SOURCE ... BOOTSTRAP_SERVERS='bench_kafka:9092'`.
 
-**First `kafka_*` run needs a client-image rebuild.** `seed_kafka.py` and the
-stream runner import `confluent-kafka`, added to `Dockerfile.benchmark`. If a
+**First `kafka_*` run needs a client-image rebuild.** `benchmark/data/seed_kafka.py` and the
+stream runner import `confluent-kafka`, added to `benchmark/Dockerfile.benchmark`. If a
 `benchmark-client:latest` image built without it is still cached,
 run once with `--rebuild` (or `--clear`) so the seed step doesn't fail with
 `ModuleNotFoundError: confluent_kafka`.
 
-### Dataset (`data/generate_kafka_fixtures.py`)
+### Dataset (`benchmark/data/generate_kafka_fixtures.py`)
 
 Primitive columns only — `json_to_chunk` supports exactly
 INTEGER / BIGINT / DOUBLE / STRING / BOOLEAN:
@@ -468,7 +479,7 @@ INTEGER / BIGINT / DOUBLE / STRING / BOOLEAN:
 | `amount` | DOUBLE | named `amount` (not `value`) to dodge the reserved word in SELECT |
 | `ts` | BIGINT | monotonic epoch-ms |
 
-Sized from `bench.yaml`:
+Sized from `benchmark/bench.yaml`:
 
 ```yaml
 kafka:
@@ -478,8 +489,9 @@ kafka:
 
 ### Standalone / local run (no docker harness)
 
-The runner and the seed/generate scripts take `--local` / `--broker`, so the
-whole thing runs against a hand-started redpanda + a local Debug server without
+The runner takes `--local` / `--broker` (the seed script `--broker` / `--topic` /
+`--file`, the fixture generator `--out`), so the whole thing runs against a
+hand-started redpanda + a local Debug server without
 the docker image build:
 
 ```bash
@@ -540,7 +552,7 @@ benchmark_results/<run>/
 
 ## Connector pattern
 
-All 15 benchmark scripts are identical in structure:
+All 31 benchmark scripts (15 cross-backend + 10 external + 6 Kafka) are identical in structure:
 
 ```python
 from common import benchmark_main
@@ -584,8 +596,10 @@ If the image already exists, just run without `--rebuild` — images are reused 
 If you need a clean build and the remote is down, wait for it to come back.
 
 **Wrong row counts after changing bench.yaml**
-`bench.yaml` is baked into the benchmark-client image at build time. After editing it,
-run `--rebuild` (keeps DB volumes) or `--clear` (also wipes DB data and reinitialises).
+`benchmark/bench.yaml` is baked into the benchmark-client image at build time. After editing it,
+run `--rebuild` to pick up changes. The automated run still reloads fixtures
+and removes its containers and volumes at exit. Use `--clear` for an additional
+image and volume reset before the run.
 
 **Log appears frozen during join_all**
 It should not: Python stdout is unbuffered (`PYTHONUNBUFFERED=1`), so output
@@ -599,7 +613,7 @@ profiling section above and the root `CLAUDE.md` Tracy rules.
 
 ---
 
-## Stress test (`scripts/run_stress_benchmarks.sh`)
+## Stress test (`benchmark/stress/run_stress_benchmarks.sh`)
 
 Runs N escalating load stages against the same live service instance and writes
 a final `degradation_report.md` comparing throughput, latency percentiles, and
@@ -628,7 +642,7 @@ only a configurable cooling period separates them.
 
 Results land in `benchmark_results/stress/<YYYYMMDD_HHMMSS>/`.
 
-### CLI reference (`run_stress_benchmarks.sh`)
+### CLI reference (`benchmark/stress/run_stress_benchmarks.sh`)
 
 ```text
 -p, --profile FILE   YAML profile defining all stages. Overrides --workers-* and
@@ -680,8 +694,8 @@ Valid `query_pool` keys:
 
 Built-in profiles in `benchmark/stress/profiles/`:
 
-- `default.yaml` — matches the built-in defaults (1/5/15 workers, all 4 query types)
-- `select_only.yaml` — simple + complex selects only, no joins (1/5/15 workers)
+- `benchmark/stress/profiles/default.yaml` — matches the built-in defaults (1/5/15 workers, all 4 query types)
+- `benchmark/stress/profiles/select_only.yaml` — simple + complex selects only, no joins (1/5/15 workers)
 
 ### Output structure
 
@@ -704,7 +718,7 @@ benchmark_results/stress/<YYYYMMDD_HHMMSS>/
 
 | Module | Role |
 | ------ | ---- |
-| `profiles.py` | `StageConfig` dataclass, YAML loading (`load_profile`), built-in defaults (`build_stages`) |
-| `stress_runner.py` | Threaded worker engine (`run_stage`) — persistent connections, round-robin query pool, per-category latency tracking, reconnect on error |
-| `report.py` | Aggregation (`build_stage_result`), JSON output with `by_query_type`, degradation markdown report with per-category breakdown section |
-| `stress_main.py` | CLI entry point; orchestrates all stages and writes final report |
+| `benchmark/stress/profiles.py` | `StageConfig` dataclass, YAML loading (`load_profile`), built-in defaults (`build_stages`) |
+| `benchmark/stress/stress_runner.py` | Threaded worker engine (`run_stage`) — persistent connections, round-robin query pool, per-category latency tracking, reconnect on error |
+| `benchmark/stress/report.py` | Aggregation (`build_stage_result`), JSON output with `by_query_type`, degradation markdown report with per-category breakdown section |
+| `benchmark/stress/stress_main.py` | CLI entry point; orchestrates all stages and writes final report |

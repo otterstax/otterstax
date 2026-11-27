@@ -58,14 +58,8 @@ the exact message sequence the server answers with:
     text, not the bound one.
   * Bind asking for binary result columns: RowDescription reports format code
     1 for every column.
-  * A `hugeint` result column is carried in text: it is described as NUMERIC
-    (oid 1700) — PostgreSQL's own fixed-point type, variable length, no declared
-    typmod — from a simple Query, from Describe and from an Execute the client
-    never described. In **binary** it is refused, like every NUMERIC: binary
-    NUMERIC is PostgreSQL's backend-internal digit-group encoding, which this
-    frontend does not write, and a DataRow states each field's length before its
-    bytes, so a guessed encoding would desynchronise the row. The refusal is
-    ErrorResponse 0A000 naming the column, its type and the format.
+  * A `hugeint` result column is described as NUMERIC (oid 1700) in text and
+    binary results. Binary Execute reports format code 1.
   * A result column the PG wire cannot encode at all — a `uhugeint` column, for
     which the frontend maps no type — is ErrorResponse 0A000 naming the column,
     its type and the result format, from a simple Query, from Describe and from
@@ -348,10 +342,7 @@ class PgExtendedProtocolTest:
         self.table_created = True
         values = ", ".join(f"({i}, 'row_{i}')" for i in range(1, ROWS + 1))
         self.assert_no_error(self.wire.query(f"INSERT INTO {DB}.{TABLE} (id, name) VALUES {values}"), "INSERT")
-        # Both tables stay empty: the column type alone is what is tested, and an
-        # empty result keeps its columns. `hugeint` is carried as NUMERIC in text
-        # and refused in binary; `uhugeint` has no wire type and is refused in
-        # either format.
+        # Keep both tables empty to test column metadata and type errors.
         self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{WIDE_TABLE} (id INT, big hugeint)"),
                              "CREATE TABLE with a hugeint column")
         self.wide_table_created = True

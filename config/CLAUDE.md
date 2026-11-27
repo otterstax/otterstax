@@ -40,7 +40,7 @@ Nothing in `config/` throws. Every entry point returns a
 |---------|------|---------------|
 | file is not YAML (`YAML::LoadFile` refuses it) | `invalid_text_representation` | the path + yaml-cpp's own message |
 | a `service.*` value that cannot be read as its type (`port: abc`), or a service port outside 1..65535 (`port: 70000`) | `invalid_parameter` | the field (`service.mysql.port`) |
-| a `service.runtime` pool size out of range, an empty directory, or one of those sections (or a pool) that is not a mapping | `invalid_parameter` | the field (`service.engine.data_dir`, `service.runtime.general.threads`) |
+| a `service.runtime` pool size out of range, an empty `data_dir`, or one of those sections (or a pool) that is not a mapping | `invalid_parameter` | the field (`service.engine.data_dir`, `service.runtime.general.threads`) |
 | a section that is present and not a mapping — the document itself (an empty file is the defaults), `service`, `service.flight_sql` / `mysql` / `postgres` / `spark_connect` / `connection_retry` (`service: {mysql: 8816}`) | `invalid_parameter` | the field (`service.mysql`, `(document)`) + "expected a mapping of keys" |
 | a connection entry that is a scalar (`mysql: [name]`) | `invalid_parameter` | the section + entry position + "expected a mapping of keys" |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
@@ -54,15 +54,15 @@ Nothing in `config/` throws. Every entry point returns a
 
 The yaml-cpp calls (`YAML::LoadFile`, `Node::as<T>()`) are the only throwing
 sites; each is wrapped in a try/catch exactly where it is made and converted to
-the value above (`yaml_scalar.hpp` for `as<T>()`, `load_config` for
+the value above (`config/yaml_scalar.hpp` for `as<T>()`, `load_config` for
 `LoadFile`). A subscript (`node["key"]`) throws `BadSubscript` on a scalar, so
 no key is read off a node before it is known to be a mapping: `require_map`
-(`config.cpp`) at the top of every section reader (`read_port`,
+(`config/config.cpp`) at the top of every section reader (`read_port`,
 `parse_flight_sql`, `parse_spark_connect`, `parse_connection_retry`,
 `parse_engine`, `parse_runtime`, `pool_config`) and for `service` and the
 document in `load_config`; `entry_reader_t` refuses a scalar connection entry
 before its first key. **No key is unknown**: every mapping the reader reads is
-checked against the keys it knows (`require_known_keys`, `yaml_scalar.hpp`) right
+checked against the keys it knows (`require_known_keys`, `config/yaml_scalar.hpp`) right
 after `require_map` — a connection entry before any field is read, so an entry
 with a typo is reported for the typo, not as incomplete — and a key it does not
 know is refused naming the key and its place: a typo (`pool_sise`) or a key no
@@ -86,7 +86,7 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
 - `config::EngineConfig` (`service.engine`) — the embedded otterbrix engine:
   `data_dir` (required, no default: `main.cpp` refuses to start while it is empty;
   the engine's `.lock`, WAL and tables) and
-  `log_dir` (empty → `data_dir`; `config::log_directory(engine)` answers it). `log_dir` is where
+  `log_dir` (empty — omitted or written `""` — → `data_dir`; `config::log_directory(engine)` answers it). `log_dir` is where
   **every** log file of the server goes: `main.cpp` reads the config first (a refused
   argument or file is written to stderr, there are no loggers yet), then
   `initialize_all_loggers(config::log_directory(...))`, and the engine's log is written
@@ -97,7 +97,7 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   `otterstax::runtime::make_engine_configuration` (`runtime/engine.hpp`) turns it
   into the engine's `configuration::config`, with `main_path`, the locked directory,
   set to `data_dir`. `main.cpp` opens the engine with it
-  (`engine_t::open(runtime, server_config.engine)`, `runtime/CLAUDE.md`).
+  (`engine_t::open(runtime, server_config.engine, remote->primitives())`, `runtime/CLAUDE.md`).
 - `config::RuntimeConfig` (`service.runtime`) — **every thread pool of the
   server**, so `config.yaml` sizes all of them; nothing is sized from the machine
   in code except the documented auto value of a `threads: 0`. Nine `PoolConfig
@@ -132,7 +132,7 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   `spark.connect.session.manager.defaultSessionTimeout`, 60m; 0 keeps sessions
   until ReleaseSession; `frontend/CLAUDE.md`, Spark Connect).
 - `config::ConnectionRetryConfig` — `{ int max_attempts = 1; int delay_ms = 1000; }`
-  (plain data, lives in `connections/connection_config.hpp`). Startup retry policy
+  (plain data, lives in `config/connections/connection_config.hpp`). Startup retry policy
   for opening backend connections. `max_attempts <= 1` = single attempt.
 - `config::ConnectionsConfig` — `{ vector<MysqlConnectionDesc> mysql;
   vector<PgConnectionDesc> postgresql; vector<ChConnectionDesc> clickhouse;
@@ -166,14 +166,14 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   which the file names), so a refused file reaches the operator as `main`'s own
   line on stderr (`main` logs the file it loaded once the loggers exist).
 - `parse_connections(const YAML::Node&, std::pmr::memory_resource*)` (a free
-  function in `connections/connection_config_reader.cpp`) →
+  function in `config/connections/connection_config_reader.cpp`) →
   `core::result_wrapper_t<ConnectionsConfig>`. A null/missing node → empty
   config; each section (mysql/postgresql/clickhouse/s3) is optional. It is a
   pure function (no logging, no file IO) so it is trivially unit-testable on a
   parsed node — and it **validates every entry: the first incomplete one (or
   non-scalar field, or malformed port) is returned as `invalid_parameter`**
   (fail-fast: a broken connection must not start the server).
-- `validation_error(const <Desc>&)` (also in `connection_config_reader.cpp`) —
+- `validation_error(const <Desc>&)` (also in `config/connections/connection_config_reader.cpp`) —
   pure per-descriptor checks returning the first missing required field (or the
   malformed port), or `std::nullopt`. Required: `alias/host/username/database`
   for backends (port is optional — the connector falls back to the driver
@@ -182,7 +182,7 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   connectors apply); `alias/access_key/secret_key` for s3. After the required
   fields (before the port) every section refuses the **reserved aliases**,
   compared case-insensitively (`reserved_connection_aliases` in
-  `connection_config_reader.hpp`): `federation` (`reserved_connection_alias`,
+  `config/connections/connection_config_reader.hpp`): `federation` (`reserved_connection_alias`,
   defined as the federation's `metadata_database` — a header-only constant),
   OtterStax's own database (`federation.public.remote_names`, the backends'
   spelling of the remote tables, `otterbrix/federation/metadata.hpp`;
@@ -283,7 +283,7 @@ service:
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
   engine:                           # embedded otterbrix engine
     data_dir: /tmp/test_collection_sql/base   # required; holds .lock, the WAL and the tables
-    log_dir: <dir>                  # default data_dir; every log file of the server
+    log_dir: <dir>                  # omitted or "" means data_dir; every log file of the server
   runtime:                          # thread pools; every key optional
     general:  { threads: 3 }        # engine pools: threads >= 1
     exec:     { threads: 3 }
@@ -306,7 +306,7 @@ connections:
     - { alias: <a>, access_key: <k>, secret_key: <s>, region: <r>, endpoint: <e> }
 ```
 
-`alias` must not be `federation` or `main` (any case) in any section, a backend
+`alias` must not be `local`, `federation` or `main` (any case) in any section, a backend
 alias must match `[a-z_][a-z0-9_]*`, and an alias another backend entry (any
 backend section) or another s3 entry already takes aborts startup. `port` is an
 **optional string** (empty → driver default; otherwise a decimal integer in
@@ -338,12 +338,12 @@ rules).
 ## Adding a new backend type
 
 1. Add a `*ConnectionDesc` struct + a `vector<...>` field on `ConnectionsConfig`
-   (`connections/connection_config.hpp`).
+   (`config/connections/connection_config.hpp`).
 2. Parse a new sub-section in `parse_connections` through an `entry_reader_t`
    (so a non-scalar field is reported, not thrown), and add its `validate_all`
-   pass (`connections/connection_config_reader.cpp`).
+   pass (`config/connections/connection_config_reader.cpp`).
 3. Add a `validation_error(const <Desc>&)` overload for its required fields
-   (`connections/connection_config_reader.{hpp,cpp}`).
+   (`config/connections/connection_config_reader.{hpp,cpp}`).
 4. Open it in `remote_backends_t::open` (descriptors are already validated at
    parse time: convert the descriptor into the connector's `connect_params`, build
    its agents over the connector factory — `connectors/CLAUDE.md` — and its backend
@@ -356,7 +356,7 @@ rules).
 parsing, null/missing node, missing sections, pg `schema` empty when omitted, optional s3
 fields, order preservation, the `pool_size` default 4, **`invalid_parameter` on an incomplete entry, a
 malformed port, a non-scalar field, a bad `pool_size`, or the reserved aliases
-`federation` / `main` / `local` in any case and any section** (`test_connection_names.cpp`; an alias merely containing
+`federation` / `main` / `local` in any case and any section** (`tests/unit/config/test_connection_names.cpp`; an alias merely containing
 the word is accepted; `kafka` is accepted), **a backend alias taken twice across sections, two equal
 s3 aliases** (an s3 alias equal to a backend alias, or differing in case, is
 accepted), the `[names]` table of backend aliases (duplicates within and across
@@ -374,20 +374,20 @@ a backend alias taken twice aborting the load, no-`connections:` section, **malf
 `invalid_parameter`**, every `service` section — `service` itself and the
 document included — given as a scalar or a sequence → `invalid_parameter`
 naming it, an empty file the defaults, and a scalar connection entry in every
-section → `invalid_parameter` naming the entry). `test_engine_config.cpp` covers `service.engine` /
+section → `invalid_parameter` naming the entry). `tests/unit/config/test_engine_config.cpp` covers `service.engine` /
 `service.runtime`: the defaults when the sections or the file are absent, every
 key read, one key overriding only its own default, the keys an older file may
 still carry (`wal_dir`, `disk_dir`, `log_level`, `executor_pool_size`,
 `dml_flush_row_threshold`, `pump`, a pool's `max_throughput`) refused like any
 unknown key, and `invalid_parameter` naming the field for every refused value
-(an empty or non-scalar directory, non-mapping sections, engine pools with 0 threads, out-of-range or
-textual pool sizes; the four frontend pools read, one alone overriding only its
-own default, and refused the same way). `test_connection_config.cpp` also pins an
+(an empty `data_dir`, a non-scalar directory, non-mapping sections, engine pools with 0 threads, out-of-range or
+textual pool sizes; `log_dir: ""` loading as not set — the logs to `data_dir`; the four frontend pools read, one alone overriding only its
+own default, and refused the same way). `tests/unit/config/test_connection_config.cpp` also pins an
 unknown key at every level (`unknown key "<key>" in <place>`, an entry's typo
 reported before its missing fields), the refusal of the alias `federation`
-naming what the database holds, and that every `config*.yaml` the repository
-ships (found under `OTTERSTAX_SOURCE_DIR`, the build trees and `.git` skipped:
+naming what the database holds, and that every YAML file whose name starts with
+config and ends in .yaml loads (found under `OTTERSTAX_SOURCE_DIR`, the build trees and `.git` skipped:
 the template, the demo, the quick start, the benchmarks, the integration tests,
-the manual stack) loads. How `backends_threads` sizes the backends
+the manual stack). How `backends_threads` sizes the backends
 pool against the connections is pinned in `tests/system/test_process_assembly.cpp`.
 Nothing is asserted to throw.

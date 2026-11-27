@@ -461,7 +461,9 @@ count rows. Every Kafka statement is built by a `sql_*` helper at the top of
 `CREATE SOURCE ... BOOTSTRAP_SERVERS='bench_kafka:9092'`.
 
 **First `kafka_*` run needs a client-image rebuild.** `benchmark/data/seed_kafka.py` and the
-stream runner import `confluent-kafka`, added to `benchmark/Dockerfile.benchmark`. If a
+stream runner import `confluent-kafka`. The client image installs it from
+`benchmark/requirements.txt` using the version in `tests/requirements-client.txt`.
+If a
 `benchmark-client:latest` image built without it is still cached,
 run once with `--rebuild` (or `--clear`) so the seed step doesn't fail with
 `ModuleNotFoundError: confluent_kafka`.

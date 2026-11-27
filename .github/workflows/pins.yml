@@ -1,0 +1,22 @@
+name: Version Pins
+
+# One source per pinned version, and the compose files' rustfs pin still Docker Hub's
+# latest (scripts/check_pins.sh, tests/CLAUDE.md "Pinned test dependencies"). A red on
+# latest is a bump to do, in its own commit with a full ./docker-run-tests.sh. Daily
+# too: latest moves without a commit here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  pins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version pins
+        run: ./scripts/check_pins.sh

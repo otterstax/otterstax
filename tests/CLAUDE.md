@@ -43,6 +43,34 @@ Execute delivers the bound value. It is `I` after a failed pipeline outside a bl
 
 The Spark Connect files — `tests/test_spark_client_{mysql,pg,cross}_backend.py`, `tests/test_spark_client_dataframe_ops.py` (DataFrame operations over `spark.table()` of both remote backends and of a local table, each checked against the same query written as SQL — the chains that read a derived table included: `select().count()`, `distinct().count()`, `limit().first()`, `groupBy().agg().select()`, a filter over an aggregate, `select().select()`, a `spark.sql` LIMIT under `limit()` — and `unionByName()` over reordered columns refused; `avg` over the local table's BIGINT column is checked against the DOUBLE mean of its rows, fraction kept), `tests/test_spark_client_sql_and_show.py` (`spark.sql()` running its statement once: derived-table queries over the MySQL and PostgreSQL backends, `count()`, DDL and an INSERT that collecting their DataFrames does not run again; `df.show()` with its defaults, with the footer, untruncated, vertical and over a `spark.sql()` query, against text rebuilt by Spark's rules) and `tests/test_spark_client_catalog.py` (`spark.catalog` over both remote backends and a local database made through `spark.sql()`) — are not in the standard suite (`test-client`). They run under every released PySpark client — 3.5.0–3.5.9, 4.0.0–4.0.4, 4.1.0–4.1.3 and 4.2.0, 20 versions — in an image of their own, `Dockerfile.spark-test` (compose service `test-spark-client`): Python 3.12, plus Python 3.11 for 3.5.x, and no JVM; one dependency venv per minor line (4.1 and 4.2 share one) and each client installed on its own with `pip install --no-deps --target /opt/pyspark/<version>` (`tests/scripts/install_spark_clients.sh`: 3.5.x the `pyspark` sdist with its jars removed, 4.x `pyspark-client`). `tests/scripts/run_spark_matrix.sh` runs every `tests/test_spark_client_*.py` under each version — six files × 20 versions — `SPARK_MATRIX_JOBS` versions at a time (default 4), and prints a version × file PASS/FAIL table; `docker-run-tests.sh` runs it as a separate step after the standard suite. The three integration workflows, ASAN and TSAN included, run the full matrix: they pre-build the image with the buildx GHA cache scope `spark-client` and pass its tag in `SPARK_CLIENT_IMAGE`, which makes `docker-run-tests.sh` skip building it. The files use only API present in PySpark 3.5, so each runs unchanged on every client; several clients run against one server at once, so a file that creates objects names them uniquely.
 
+**Pinned test dependencies.** The integration and benchmark client images share pins for
+the Python libraries listed below. RustFS and the integration test's S3 fixture image
+also have digest pins. These pins address past failures from changes to the ADBC
+`get_objects` API and to the AWS CLI image used for S3 seeding.
+
+- Python clients of `test-client`: `tests/requirements-client.txt`, every package `==` (direct ones and the
+  transitive ones that broke a run: `adbc-driver-manager`, `psycopg-binary`, `protobuf`; no extras, so it
+  serves as a constraints file), installed by `Dockerfile.integration-test` with `pip install -r`. It is
+  the ONE source of a version: `benchmark/requirements.txt` names its packages bare under
+  `-c ../tests/requirements-client.txt`, and only a package that file does not pin carries its own `==`
+  there. PySpark clients are pinned in `Dockerfile.spark-test`.
+- Images: every Compose file that uses RustFS specifies its release tag and digest
+  (`compose.test.yml`, `compose.debug.yml`, `tests/s3/docker-compose.yml`,
+  `examples/quick_start/compose.yml`, `examples/demo/compose.yml`, and
+  `benchmark/compose_rustfs.yml`). Docker pulls by digest. The integration test's
+  `tests/s3/Dockerfile.fixtures` also pins its AWS CLI base image by digest.
+  The examples' AWS CLI seed jobs still use `latest`.
+- The GitHub [Version Pins workflow](../.github/workflows/pins.yml) runs
+  `scripts/check_pins.sh` on pull requests to main, pushes to main, and daily.
+  It checks Python constraint consistency, agreement among RustFS pins, and
+  whether the release tag and `latest` still resolve to the pinned digest.
+  If only `latest` has moved, this check fails while Compose continues to pull
+  the recorded digest. Review the new image before bumping the pin.
+- **A bump is its own commit**: edit the requirements file (or the version and digest together, the digest
+  of the release's tag: `docker buildx imagetools inspect rustfs/rustfs:<version>`) and nothing else, then
+  a full `./docker-run-tests.sh` — image build, `rustfs-init` seed, integration suite — before it merges.
+  Known traps: PyMySQL 1.4.6 drops the `_binary` introducer (`test_bytes_parameter`).
+
 ## Mock Layer (`tests/mock/`)
 
 System tests build the full actor graph with a real otterbrix and injected connectors:

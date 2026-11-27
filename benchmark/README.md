@@ -4,9 +4,9 @@ This directory contains three independent benchmark systems:
 
 | System | What it measures | Requires |
 | --- | --- | --- |
-| **Microbenchmarks** (`microbench/`) | C++ hot-path latency (translators, parser, schema) | Local build only |
-| **End-to-end benchmarks** (`scripts/`, `benchmarks/`) | Serial query latency over wire protocols | Docker + DB containers |
-| **Stress test** (`stress/`) | Concurrent load: throughput, latency percentiles, error rate across escalating stages | Docker + DB containers |
+| **Microbenchmarks** (`benchmark/microbench/`) | C++ hot-path latency (translators, parser, schema) | Local build only |
+| **End-to-end benchmarks** (`scripts/`, `benchmark/benchmarks/`) | Serial query latency over wire protocols | Docker + DB containers |
+| **Stress test** (`benchmark/stress/`) | Concurrent load: throughput, latency percentiles, error rate across escalating stages | Docker + DB containers |
 
 ---
 
@@ -38,9 +38,9 @@ Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 | `BM_ch_to_chunk_multiblock_10k` | Multi-block merge path |
 | `BM_ch_to_struct` | Schema extraction from ClickHouse Block |
 | `BM_chunk_to_arrow_schema_{10,50}col` | `data_chunk_t` schema → Arrow schema |
-| `BM_mysql_type_mapping_all` | Full MySQL column-type enum mapping |
-| `BM_parse_{simple_select,join_3table,cross_backend,subquery}` | `GreenplumParser::parse()` |
-| `BM_prepare_sql_{simple,cross_backend,subquery}` | `prepare_sql()` subquery extraction |
+| `BM_pg_to_struct` | Schema extraction from a libpq PostgreSQL result |
+| `BM_parse_{simple_select,complex_select,join_3table,cross_backend,subquery,three_backend_join}` | `GreenplumParser::parse()` |
+| `BM_registry_parse_{core_select,file_create,s3_create}` / `BM_{file,s3}_ext_parse_{create,copy}` | grammar-extension statement parse |
 
 ### CLI reference
 
@@ -64,13 +64,7 @@ via the MySQL wire, PostgreSQL wire, and Arrow/FlightSQL frontends.
 ## Prerequisites
 
 - Docker Desktop (or Docker Engine + Compose v2)
-- `otterstax_app:bench` image — build it once:
-
-  ```bash
-  ./benchmark/scripts/run_benchmark.sh --rebuild
-  ```
-
-  After that, images are reused automatically on every run.
+- The runner builds missing images and reuses them on subsequent runs.
 
 ---
 
@@ -78,6 +72,12 @@ via the MySQL wire, PostgreSQL wire, and Arrow/FlightSQL frontends.
 
 Run everything end-to-end — builds images if needed, starts databases, initialises
 data, runs all benchmarks, and writes results.
+
+Use a disposable Docker environment without a manual benchmark stack and
+leave `COMPOSE_PROJECT_NAME` unset. Every automated run reloads the benchmark
+fixtures and removes its Compose containers and volumes at exit.
+`--rebuild` forces image builds. `--clear` also removes the images and backend
+volumes before the run.
 
 ```bash
 # Default: mysql + postgres + arrow frontends, the 5 cross-backend tests, 10 reps each
@@ -91,7 +91,7 @@ data, runs all benchmarks, and writes results.
 ./benchmark/scripts/run_benchmark.sh \
   --frontend mysql --bench join_all join_cross_engine --repetitions 3
 
-# Full clean slate (wipes DB volumes)
+# Also reset images and DB volumes before the run
 ./benchmark/scripts/run_benchmark.sh --clear
 ```
 
@@ -158,7 +158,7 @@ files as the automated run, plus a `summary.md`.
 ### 4. Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/q.sql
+echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/q.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/q.sql
 ```
 
@@ -202,7 +202,7 @@ Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
 (seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown. `mysql` and `postgres` frontends only — there is no arrow script for
-them (the Flight SQL DDL path is not covered), so `run_benchmark.sh` skips arrow.
+them (the Flight SQL DDL path is not covered), so `benchmark/scripts/run_benchmark.sh` skips arrow.
 
 | Test                  | Workload                                                                                | Sub-tests |
 |-----------------------|-----------------------------------------------------------------------------------------|-----------|
@@ -214,14 +214,12 @@ them (the Flight SQL DDL path is not covered), so `run_benchmark.sh` skips arrow
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage (external load + a hand-built `bigint` engine table).
-A direct backend.int32 ⋈ s3.int64 JOIN silently returns zero rows
-("JOIN-key width sensitivity" in `tests/CLAUDE.md`), so the benchmarks follow the same staged
-shape the python tests use.
+The benchmarks follow the staged shape the Python tests use.
 
 Selecting any `external_*` test automatically:
 
-1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`.
-2. Adds `compose_rustfs.yml` to the stack (RustFS + a one-shot that seeds `bench-bucket`).
+1. Generates fixtures into `benchmark/data/fixtures/` via `benchmark/data/generate_external_fixtures.py`.
+2. Adds `benchmark/compose_rustfs.yml` to the stack (RustFS + a one-shot that seeds `bench-bucket`).
 
 The `bench_rustfs` s3 alias is declared in `benchmark/config.yaml` and
 registered at server startup (no runtime registration step).
@@ -238,7 +236,7 @@ registered at server startup (no runtime registration step).
 ```
 
 Manual flow: start with `--external` so RustFS + fixtures + s3 alias are ready
-before `run_bench.sh` selects the tests:
+before `benchmark/manual/run_bench.sh` selects the tests:
 
 ```bash
 ./benchmark/manual/start_service.sh --external
@@ -246,22 +244,24 @@ before `run_bench.sh` selects the tests:
   --bench external_load external_join external_dump external_join_cross external_join_all
 ```
 
-Fixture sizes come from the `external:` block in `bench.yaml` (defaults:
+Fixture sizes come from the `external:` block in `benchmark/bench.yaml` (defaults:
 `regions.parquet` ≈ 4 k rows, `web_events.csv` ≈ 20 k rows, `campaigns.ndjson` =
-`num_campaigns`). All `int` columns are int64 to avoid the JOIN-key width trap.
+`num_campaigns`). All integer columns in these fixtures are int64.
 
 ---
 
 ## Connection aliases
 
-A remote table is named in four parts, `alias.database.schema.table` (lower case).
-MySQL / ClickHouse have the one schema `public`; a PostgreSQL connection's schema is the
-`schema` of its `config.yaml` entry (`public` here). Three parts always name a local table.
+A remote table is named in three parts, `alias.namespace.table` (lower case). The
+namespace is the backend database on MySQL / ClickHouse (`benchdb1`, `benchch1`) and
+the schema of the connection's database on PostgreSQL (`public` here). Short names need
+the session's place; `local.namespace.table` names an engine table; four parts are
+refused.
 
 ```sql
-SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 5;
-SELECT * FROM pg1.benchpg1.public.impressions LIMIT 5;
-SELECT * FROM ch1.benchch1.public.daily_stats LIMIT 5;
+SELECT * FROM mysql1.benchdb1.campaigns LIMIT 5;
+SELECT * FROM pg1.public.impressions LIMIT 5;
+SELECT * FROM ch1.benchch1.daily_stats LIMIT 5;
 ```
 
 | Alias  | Engine     | Database  | Group | Size        |
@@ -271,7 +271,7 @@ SELECT * FROM ch1.benchch1.public.daily_stats LIMIT 5;
 | pg1    | PostgreSQL | benchpg1  | A     | ~60 k rows  |
 | pg2    | PostgreSQL | benchpg2  | B     | ~5 k rows   |
 | ch1    | ClickHouse | benchch1  | A     | ~60 k rows  |
-| ch2    | ClickHouse | benchch2  | B     | ~5 k rows   |
+| ch2    | ClickHouse | benchch2  | B     | ~5 k (events ~4 k) |
 
 ---
 
@@ -301,7 +301,7 @@ QPS, p50/p95/p99 per category). The `degradation_report.md` compares all stages 
 by side — overall throughput and latency, plus a per-category sub-table for each query
 type.
 
-See [`stress/CLAUDE.md`](stress/CLAUDE.md) for full developer documentation.
+See [`benchmark/stress/CLAUDE.md`](stress/CLAUDE.md) for full developer documentation.
 
 ---
 

@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`connectors/` provides raw connectivity. The SQL backends (`mysql/`, `postgresql/`, `clickhouse/`) are
+`connectors/` provides raw connectivity. The SQL backends (`connectors/mysql/`, `connectors/postgresql/`, `connectors/clickhouse/`) are
 one connector class each — **one physical connection** — with no pool and no threads of their own: a
 federation backend agent (`otterbrix/federation/backend_agent.hpp`, see `otterbrix/federation/CLAUDE.md`)
-owns one connector and the `io_context` it runs on. `file/` and `s3/` are `actor_zeta` actors
+owns one connector and the `io_context` it runs on. `connectors/file/` and `connectors/s3/` are `actor_zeta` actors
 (synchronous `enqueue_impl`), called from the query session and from `db::S3Manager` (`integration/s3`).
 
 Connections come from `config.yaml` once at startup (root `CLAUDE.md`, "Connection Config"):
@@ -39,8 +39,8 @@ awaitable, which `otterstax::run_with_owned_handler` (`utility/wait_barrier.hpp`
 agent; a test that awaits `runQuery` directly keeps a named callable in scope until its future settled.
 The driver results are `const boost::mysql::results&`, `PGresult*`, `const ch::select_result_t&`.
 
-A statement the backend rejects keeps the backend's verdict: `mysql/errors.hpp` (boost.mysql
-`error_code` + `diagnostics::server_message`), `postgresql/errors.hpp` (SQLSTATE), `clickhouse/errors.hpp`
+A statement the backend rejects keeps the backend's verdict: `connectors/mysql/errors.hpp` (boost.mysql
+`error_code` + `diagnostics::server_message`), `connectors/postgresql/errors.hpp` (SQLSTATE), `connectors/clickhouse/errors.hpp`
 (`ServerException::GetCode`) map syntax, missing table / column / database, duplicates, ambiguity,
 constraint failures and deadlocks onto the engine's `error_code_t` — the PostgreSQL code of the same
 verdict (`undefined_column`, `unique_violation`, `write_conflict`, …; a server code without one is
@@ -66,7 +66,7 @@ the stream that executor is read from (a TSAN race over a multi-threaded `io_con
 pins both against a fake server.
 
 **ClickHouse.** One set of `ClientOptions` for `connect()` and `tryReconnect()`
-(`clickhouse/connector.cpp`): connect, recv and send timeouts of **10 s**, `send_retries = 1`, no
+(`connectors/clickhouse/connector.cpp`): connect, recv and send timeouts of **10 s**, `send_retries = 1`, no
 `ping_before_query`. The driver alone bounds only the TCP connect (5 s); every wire read is a blocking
 `recv()`, so without the bound a backend that accepted the connection and never answered froze the
 thread for good. At expiry the driver throws `std::system_error` and the connector answers `io_error`:
@@ -144,14 +144,14 @@ These are `actor_zeta::actor_mixin` actors whose handlers run synchronously:
   The constructor calls `arrow::fs::EnsureS3Initialized()`; Arrow requires one matching `FinalizeS3()`
   before the process exits (otherwise it warns and may segfault during static teardown), and
   finalization is terminal — every S3 call fails afterwards — so it is not the manager's to do.
-  `conn::s3::subsystem_finalizer_t` (`s3_subsystem.hpp`) is the process-level RAII guard: the server's
+  `conn::s3::subsystem_finalizer_t` (`connectors/s3/s3_subsystem.hpp`) is the process-level RAII guard: the server's
   `main.cpp` declares one before every module, `tests/system/main.cpp` runs one when the test run
   ends.
 
 ## Adding a New Backend
 
-1. Implement `IConnector` + a `make_*_connector` factory (follow `mysql/connector.hpp`) and an
-   `errors.hpp` mapping the server's codes.
+1. Implement `IConnector` + a `make_*_connector` factory (follow `connectors/mysql/connector.hpp`) and a
+   `connectors/<backend>/errors.hpp` mapping the server's codes.
 2. Add a descriptor + parsing section in `config/connections/` and a factory in
    `backends::connector_factories_t`; build its agents in `remote_backends_t::open`.
 3. Teach `federation::backend_agent_t` the connector (read / write / transaction steps / discover), add

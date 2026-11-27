@@ -12,6 +12,7 @@
 #                   Values: simple_select complex_select join_same_instance
 #                           join_cross_engine join_all
 #                           external_load external_join external_dump
+#                           external_join_cross external_join_all
 #                           kafka_ingest kafka_produce kafka_stream
 #                   (external_* require ./start_service.sh --external;
 #                    kafka_* require ./start_service.sh --kafka)

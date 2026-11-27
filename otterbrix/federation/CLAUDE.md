@@ -23,10 +23,10 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
 |------|------|
 | `backend_actor.hpp/.cpp` | `backend_actor_t`: the loop (manager_disk_t's shape: `actor_mixin`, `services::loop_thread_t`, an inbox under a mutex, `co_await actor_zeta::dispatch`), the eighteen handlers plus `discover` and `end_session`, the agents' checkout (`acquire` / `release`, the waiters' queue), the host's side (`registration_session`, `set_names_table`, `load_tables`, `stage_table` / `stage_column` / `unstage_*`, `cancel_agents`), `backend_address()` (its entry of the map `open_engine` takes), `max_rows_per_write` (PostgreSQL / MySQL 1000, ClickHouse 10 000) |
 | `backend_agent.hpp/.cpp` | `backend_agent_t`: one physical connection (agent_disk_t's shape: a `basic_actor` on the runtime's backends pool); messages `read` / `write` / `step` / `discover`, `connect` / `discover_now` (startup), `check_session` (every session it opens) / `session_refused`, `cancel`; the transaction statements of each dialect (`transaction_statement`), `mysql_update_rows_matched`, `pg_commit_rolled_back` |
-| `backend_actor_offer.cpp` | `storage_offer`'s probe and the statement of a take (`take_sql`) |
-| `reachability.hpp` | `reachability_t`: the mark a failed connect of a connection leaves for 10 s, read by its agents before they connect |
+| `otterbrix/federation/backend_actor_offer.cpp` | `storage_offer`'s probe and the statement of a take (`take_sql`) |
+| `otterbrix/federation/reachability.hpp` | `reachability_t`: the mark a failed connect of a connection leaves for 10 s, read by its agents before they connect |
 | `conform.hpp/.cpp` | `conform_to_result`: a backend's answer held to the columns otterbrix planned, by otterbrix's own explicit casts |
-| `metadata.hpp` | `federation.public.remote_names` (the host table of the backends' spelling), `fold_identifier`, `remote_table_name_t`, `generator_name`, `discovered_table_t` / `discovered_tables_t` |
+| `otterbrix/federation/metadata.hpp` | `federation.public.remote_names` (the host table of the backends' spelling), `fold_identifier`, `remote_table_name_t`, `generator_name`, `discovered_table_t` / `discovered_tables_t` |
 
 ## The actor
 
@@ -82,9 +82,19 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
 - **Offer.** An UPDATE / DELETE block is one statement or the offer is refused (`unimplemented_yet`:
   OtterStax numbers no remote row, `storage_update` / `storage_delete_rows` refuse); RETURNING on
   PostgreSQL and MySQL (every column of the table, `generation_options_t::returning`; the server answers
-  what it has — MariaDB INSERT / DELETE … RETURNING, MySQL and a MariaDB UPDATE refuse it themselves),
-  refused on ClickHouse (its mutations answer no rows); ClickHouse inside a block
-  refused. Read blocks, top down: a relation (a SELECT block, a JOIN tree of the connection) the
+  what it has — MariaDB INSERT / DELETE … RETURNING and, from 13.0, UPDATE … RETURNING; anything else
+  is the server's own refusal), refused on ClickHouse (its mutations answer no rows); ClickHouse inside a block
+  refused. To write one table using a plain source table of the same connection, send
+  `UPDATE t SET … FROM s WHERE …` or `DELETE FROM t USING s WHERE …` on either wire.
+  OtterStax pushes one statement to the backend. For MySQL or MariaDB it generates
+  `UPDATE t, s SET t.c = …` or `DELETE t FROM t, s`. Sending those MySQL forms to
+  the OtterStax MySQL wire returns a syntax error (1149). The WHERE clause joins target and
+  source. The generator qualifies each column with its table, and RETURNING columns with the
+  target. Refused `unimplemented_yet`, never written as a single-table statement:
+  a source on another connection or a local one, a source that is not a plain table, the target table
+  itself as its source, ClickHouse (its mutations name one table), a LIMIT together with a second table
+  (the offer and `check_dml_shape`; `otterbrix/CLAUDE.md`).
+  Read blocks, top down: a relation (a SELECT block, a JOIN tree of the connection) the
   dialect says whole is taken (its answer the node's `output_types`); else, for a SELECT block of one
   table, its WHERE is taken with the conjuncts the dialect says, the others left as `residual` (the
   answer is the block's `projected_cols`); else the children are tried. A take keeps the block
@@ -171,7 +181,7 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
 ## Tests
 
 `tests/federation/` (`test_federation`): a real otterbrix (`otterbrix::base_otterbrix_t`) opened with
-one actor per connection over agents on fake connectors (`federation_fixture.hpp`,
+one actor per connection over agents on fake connectors (`tests/federation/federation_fixture.hpp`,
 `tests/mock/fake_backend.hpp`: canned tables, a log of every statement and transaction step, answers
 settled on the pool's threads on demand): registration
 without SQL, restarts (no DDL, the spelling kept, a dropped table, a changed column, an unreachable
@@ -180,8 +190,14 @@ order, an empty table, a refusal, a JOIN with a local table, two sessions over a
 the loop asleep while a statement runs, the checkout queue and its timeout, an unreachable
 connection);
 the offer per dialect (a SELECT block, GROUP BY, a JOIN of one connection, a residual WHERE,
-UPDATE / DELETE whole, a refused UPDATE, RETURNING, an UPDATE narrowing its value to the column on a
-strict and a non-strict MySQL session and on ClickHouse); transactions (autocommit, a block, ROLLBACK,
+UPDATE / DELETE whole, a refused UPDATE — one whose source is a local table —, RETURNING, an UPDATE
+narrowing its value to the column on a strict and a non-strict MySQL session and on ClickHouse); the
+two-table statements as the generator writes them (`tests/unit/parser/test_query_gen.cpp`: `DELETE ... USING`
+and `UPDATE ... FROM` per dialect, through the parser, pushed down with the source resolved; a LIMIT
+with a second table and an unresolved source refused). A live check on rc-7 confirmed both
+forms on PostgreSQL and MariaDB, including the affected-row count, the stored rows and the
+unchanged source table. There is no automated end-to-end case for these forms in the suite.
+Transactions (autocommit, a block, ROLLBACK,
 ROLLBACK TO, a reader's unpin, a refused write, ClickHouse, a client's DDL and its refusals, a broken
 PostgreSQL / MySQL transaction); `conform_to_result`. `tests/unit/connectors/test_backend_agent.cpp`
 (`test_unit_connectors`): the agent's transaction statements per dialect, a failed COMMIT, cancel, a

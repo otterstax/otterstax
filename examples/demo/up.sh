@@ -11,8 +11,8 @@
 #   FlightSQL  localhost:8815
 #
 # Connections are no longer registered over HTTP — they are read once at server
-# startup from the single config file (config.yaml, mounted into the container
-# by compose.yml). Edit that file and restart to change them.
+# startup from the single config file (config.yaml, mounted at
+# /otterstax/config.yaml by compose.yml). Edit that file and restart to change them.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -86,6 +86,14 @@ for svc in $WAIT_SVCS; do
     done
 done
 
+# The server's port check can pass before the one-shot RustFS upload finishes.
+echo "=== Waiting for demo S3 fixtures ==="
+if ! seed_exit=$(${DOCKER_PREFIX}docker wait demo-rustfs-init) || [ "$seed_exit" != "0" ]; then
+    echo "❌ Demo S3 seeding failed. See Step 8 troubleshooting in examples/demo/CLAUDE.md." >&2
+    $COMPOSE_CMD -f compose.yml logs --tail 30 demo-rustfs-init >&2
+    exit 1
+fi
+
 # --- 4. Connections ---
 # In full mode, config.yaml is mounted into the otterstax container and read at
 # startup (server settings + connections) — nothing to register here. In local
@@ -107,13 +115,14 @@ cat <<'EOF'
 
   Now start your local otterstax server (single config file with the
   host-published backend ports + connections):
-    ./build/server --config examples/demo/config_local.yaml
+    ./build/Release/server --config examples/demo/config_local.yaml
 
   Connections (mysql/pg/ch/s3) load from that same file at startup — no
   separate registration step.
 
-  Run all demo queries (steps 1-9, incl. s3 load + dump):
+  On a fresh engine, run all demo queries (steps 1-9, incl. S3 load + dump):
     examples/demo/run-queries.sh
+  To replay a used engine, see Re-running in examples/demo/CLAUDE.md.
 
   Run the Kafka streaming act — step by step (source ingestion, JOIN kafka⋈ch⋈pg,
   stream, fan-in); walk them in order:
@@ -121,7 +130,9 @@ cat <<'EOF'
     examples/demo/kafka/2_join/run.sh      --local
     …  (see examples/demo/kafka/README.md; or run_all.sh --local for a smoke test)
 
-  Tear down with: examples/demo/down.sh
+  Stop the local server to free port 8817. examples/demo/down.sh wipes the
+  Docker backends and their volumes. For a clean local engine, see Pause or
+  reset in examples/demo/CLAUDE.md.
 ================================================================================
 EOF
 else
@@ -141,7 +152,7 @@ cat <<'EOF'
 
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_1.sql
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_2.sql
-    psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3a_ddl.sql
+    psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3a_ddl.sql
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3b_insert.sql
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3c_select.sql
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3d_main.sql
@@ -152,7 +163,7 @@ cat <<'EOF'
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_8.sql   # s3 parquet load
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_9.sql   # JOIN + dump back to s3
 
-  Or all at once:
+  Or all at once on a fresh engine:
     examples/demo/run-queries.sh
 
   Run the Kafka streaming act — step by step (see examples/demo/kafka/README.md):
@@ -160,8 +171,9 @@ cat <<'EOF'
     examples/demo/kafka/2_join/run.sh
     …  (or examples/demo/kafka/run_all.sh for a smoke test)
 
-  After running steps 3a-3b / 7-8 (which create otter.warehouses / otter.regions /
-  otter.promos), run cleanup before re-doing the demo:
+  To fully reset local.otter before redoing the demo (including user objects in
+  that schema and its dependents), run cleanup. For a scoped cleanup, see
+  Re-running in examples/demo/CLAUDE.md.
 
     psql -h localhost -p 8817 -U demo local -f examples/demo/sql/cleanup.sql
 

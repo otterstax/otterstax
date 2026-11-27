@@ -17,9 +17,9 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
 - `otterstax::kafka` — the public actor (`KafkaManager`) and the grammar
   (`kafka_node_t`, `kafka_op`, `kafka_write_target`, `kafka_stream_source`,
   `kafka_find_aggregate`, `kafka_column_t`).
-- `otterstax::kafka::detail` — the implementation in `detail/` (the RAII
+- `otterstax::kafka::detail` — the implementation in `integration/kafka/detail/` (the RAII
   consumer/producer, the poller/stream threads, and the reader helpers). The
-  manager sources (`detail/kafka_manager*.cpp`) do `using namespace detail;`; `kafka_manager.hpp` qualifies
+  manager sources (`integration/kafka/detail/kafka_manager*.cpp`) do `using namespace detail;`; `integration/kafka/kafka_manager.hpp` qualifies
   members as `detail::kafka_*_t`. External code (the query session, tests) reaches the
   helpers as `otterstax::kafka::detail::json_to_chunk` etc.
 
@@ -164,7 +164,7 @@ a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target
 lets through an INSERT whose target, as written, can name a Kafka object (no
 connection, a written database `local`, a written schema `kafka`). It is a Kafka
 write when `object_names().contains(<last part>)` and the name, its empty slots
-completed with the session's place (`SELECT current_database(), current_schema()`
+completed with the session's place (`SELECT current_connection(), current_database(), current_schema()`
 on the connection's engine session, asked only then; a three-part name needs
 none), is `local.kafka.<obj>` (`kafka_target_named`): `kafka.s` from a place in
 `local` (`local.public`), `s` from `local.kafka`, `local.kafka.s` from anywhere. Any other INSERT is the
@@ -201,5 +201,5 @@ engine's. The write splits on `source_is_select` — a `VALUES` write
   launches an INSERT INTO query whose target stream has a row but failed to
   recover. Two concurrent DROPs of one source are safe: the success path erases
   any poller the refused one relaunched.
-- Integration tests are Python `--local` scripts in `tests/` (`test_kafka_*.py`);
+- Integration tests are Python `--local` scripts in `tests/` (`tests/test_kafka_*.py`);
   the broker is the `kafka` service in `compose.test.yml` (`127.0.0.1:19092`).

@@ -65,11 +65,14 @@ namespace {
         }
     }
 
-    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.orders WHERE status = 'active' "
+    // Four parts (connection.database.schema.table): only the four-part spelling fills the
+    // connection slot of the parsed name, which `block_of` matches by uid — a three-part name
+    // reads as database.schema.table with an empty connection and finds no block.
+    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.schema.orders WHERE status = 'active' "
                                "ORDER BY id LIMIT 100";
-    const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.products "
+    const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.shop.products "
                                "WHERE price > 10 GROUP BY category HAVING count(*) > 1";
-    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.sessions WHERE country = 'DE' AND ts > 100";
+    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.schema.sessions WHERE country = 'DE' AND ts > 100";
 } // namespace
 
 // ── generate_query ────────────────────────────────────────────────────────────

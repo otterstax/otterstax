@@ -9,18 +9,19 @@ rules that are not written there.
 
 Size the jobs to RAM first (root `CLAUDE.md`, "Build resources"): `JOBS = min(nCPU,
 floor(RAM_MB / 1536))`, and for Docker the VM's RAM (`docker info --format '{{.NCPU}} CPUs /
-{{.MemTotal}} B'`), not the host's. On this machine `-j nproc` OOM-kills the Docker build partway
-through (`ResourceExhausted: cannot allocate memory`), so the test steps never run and the failure
-looks unrelated to the change; `-j 4` builds cleanly:
-`docker build --build-arg BUILD_JOBS=4 -f Dockerfile.test -t otterstax-test .`,
-`./docker-run-tests.sh -j 4`. If `conanfile.py` changed, remove the build directory before
-`conan install`.
+{{.MemTotal}} bytes'`), not the host's. `-j nproc` can OOM-kill the compiler
+(`c++: internal compiler error: Killed`, BuildKit's `ResourceExhausted: cannot allocate memory`):
+the build stops partway, so the test steps never run and the failure looks unrelated to the change.
+Pass the jobs computed for the machine at hand:
+`docker build --build-arg DEPS_IMAGE="$(./scripts/deps-image.sh release)" --build-arg BUILD_JOBS=<JOBS> -f Dockerfile.test -t otterstax-test .`,
+`./docker-run-tests.sh -j <JOBS>` (without `-j` the script caps them by Docker's CPUs and RAM).
+If `conanfile.py` changed, remove the build directory before `conan install`.
 
 ## Code conventions
 
 - **Actors.** Talk to an actor only through `actor_zeta::send(address, &Actor::method, args...)` and
   `co_await` the future inside an actor coroutine; a frontend awaits through
-  `frontend/common/asio_future_bridge.hpp` (Spark: `spark_connect_server/await_future.hpp`). A new
+  `frontend/common/asio_future_bridge.hpp` (Spark: `frontend/spark_connect_server/await_future.hpp`). A new
   handler: the coroutine method (returns `unique_future<T>`), its pointer in `dispatch_traits<...>`,
   its branch in `behavior()`, a Tracy zone (root `CLAUDE.md`).
 - **Memory.** Allocate on the `std::pmr::memory_resource*` you are given (the runtime's); actors are
@@ -31,8 +32,8 @@ looks unrelated to the change; `-j 4` builds cleanly:
 - **Errors.** Nothing throws across a module boundary: `core::error_t` / `core::result_wrapper_t<T>`,
   `[[nodiscard]]`; a third-party throw is caught where it is made.
 - **otterbrix first.** What otterbrix lacks is a request to otterbrix, not a workaround in
-  OtterStax; a claim about otterbrix is checked in its sources
-  (`~/CLionProjects/otterbrix`).
+  OtterStax; a claim about otterbrix is checked in its sources, at the tag `conanfile.py`
+  requires (`otterbrix` `1.0.0b2-rc-7`).
 - **Namespaces.** `otterstax::{runtime, backends, federation, catalog, session, engine, kafka}`;
   `frontend::{mysql, postgres, spark}`, `flight::*`; the connectors `mysql::` / `pg::` / `ch::`,
   `conn::s3` / `conn::file`; `db::S3Manager`; `sql_gen`, `tsl` (translators); `config::`.

@@ -39,28 +39,12 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 # fail the build on a stalled transfer.
 ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
 
-# Install Python dependencies including Faker
-RUN pip install --no-cache-dir \
-    pyarrow \
-    flightsql-dbapi \
-    # The FlightSQL e2e suite (tests/flightsql_e2e) drives the ORIGINAL Apache
-    # drivers: adbc-driver-flightsql (Go/gRPC-Go) and pyarrow (above); the
-    # protobuf stubs of the Flight messages are pre-generated next to the
-    # suite, grpcio tools are only needed to regenerate them.
-    adbc-driver-flightsql \
-    pytest \
-    grpcio \
-    grpcio-tools \
-    pymysql \
-    mysql-connector-python \
-    "psycopg[binary]" \
-    psycopg2-binary \
-    asyncpg \
-    clickhouse-driver \
-    tabulate \
-    faker \
-    requests \
-    confluent-kafka
+# Python client libraries, exact versions (tests/requirements-client.txt): an
+# unpinned install tests whatever PyPI serves that day. The FlightSQL e2e suite
+# (tests/flightsql_e2e) drives the ORIGINAL Apache drivers (adbc-driver-flightsql,
+# pyarrow); its protobuf stubs are pre-generated, grpcio-tools only regenerates them.
+COPY ./tests/requirements-client.txt /tmp/requirements-client.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-client.txt
 
 # The prebuilt Go harness from its stage; a Go toolchain is NOT shipped in
 # this image — the test runs the binary (go run stays the host-side fallback).

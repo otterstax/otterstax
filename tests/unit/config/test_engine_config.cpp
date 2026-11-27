@@ -120,6 +120,20 @@ service:
     CHECK(loaded.engine.log_dir.empty());
 }
 
+// The contract config::log_directory records: `log_dir: ""` is the key not set
+// (every log file goes to data_dir), while data_dir must name a directory.
+TEST_CASE("service.engine: an empty log_dir is the default and an empty data_dir is refused") {
+    auto loaded = load_ok("service:\n  engine:\n    data_dir: /srv/otterstax/data\n    log_dir: \"\"\n");
+    CHECK(loaded.engine.data_dir == "/srv/otterstax/data");
+    CHECK(loaded.engine.log_dir.empty());
+    CHECK(config::log_directory(loaded.engine) == "/srv/otterstax/data");
+
+    auto error = load_error("service:\n  engine:\n    data_dir: \"\"\n");
+    CHECK(error.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(error, "service.engine.data_dir"));
+    CHECK(mentions(error, "a directory must not be empty"));
+}
+
 // The keys an older config.yaml may still carry are not read any more: like any key the reader
 // does not know, each is refused, naming the key and its section, so the operator removes it.
 TEST_CASE("service.engine: keys no longer read are refused") {

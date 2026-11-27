@@ -1,6 +1,6 @@
 # Demo server config — bench/local mode (otterstax runs as a local binary,
 # backends addressed via host-published ports). Run from the repo root:
-#   ./build/server --config examples/demo/config_local.yaml
+#   ./build/Release/server --config examples/demo/config_local.yaml
 
 service:
   flight_sql:

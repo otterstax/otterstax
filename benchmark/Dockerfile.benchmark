@@ -4,16 +4,12 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --timeout 120 --retries 5 \
-    mysql-connector-python \
-    psycopg2-binary \
-    flightsql-dbapi \
-    pyarrow \
-    pymysql \
-    clickhouse-driver \
-    confluent-kafka \
-    faker \
-    pyyaml
+# Exact versions: an unpinned install measures whatever PyPI serves that day.
+# benchmark/requirements.txt takes the integration image's versions as constraints
+# (../tests/requirements-client.txt), so both files keep their repository layout.
+COPY tests/requirements-client.txt /tmp/req/tests/requirements-client.txt
+COPY benchmark/requirements.txt    /tmp/req/benchmark/requirements.txt
+RUN pip install --no-cache-dir --timeout 120 --retries 5 -r /tmp/req/benchmark/requirements.txt
 
 COPY benchmark/bench.yaml   /app/bench.yaml
 COPY benchmark/data/       /app/data/

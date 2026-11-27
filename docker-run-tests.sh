@@ -2,8 +2,8 @@
 
 set -e  # Exit on any error
 
-# Get project name (directory name, used as Docker Compose project prefix)
-PROJECT_NAME=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+# Keep test cleanup and Tracy on the project declared in compose.test.yml.
+export COMPOSE_PROJECT_NAME=otterstax-tests
 # Get the directory where this script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -223,8 +223,6 @@ echo ""
 echo "=== Step 1: Cleaning up previous state ==="
 echo ""
 compose down --volumes --remove-orphans 2>/dev/null || true
-# Clean up init directories to ensure fresh data
-rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/null || true
 
 # Only needed when this script builds test-otterstax itself (no IMAGE_TAG).
 if [ -z "${IMAGE_TAG}" ]; then
@@ -473,10 +471,10 @@ if $ENABLE_TRACY && ! $TRACY_SEP; then
     echo ""
     # Run tracy-capture as a sidecar container (the binary lives in the image, not on the macOS host).
     # It connects to test-otterstax via the Docker network and writes to the mounted profiles dir.
-    TRACY_CAPTURE_CONTAINER="tracy-capture-${PROJECT_NAME}-$$"
+    TRACY_CAPTURE_CONTAINER="tracy-capture-${COMPOSE_PROJECT_NAME}-$$"
     docker run -d \
         --name "$TRACY_CAPTURE_CONTAINER" \
-        --network "${PROJECT_NAME}_test_app_network" \
+        --network "${COMPOSE_PROJECT_NAME}_test_app_network" \
         -v "$TRACY_OUTPUT_DIR:/tracy_profiles" \
         "otterstax_app:${IMAGE_TAG:-latest}" \
         tracy-capture -a test-otterstax -p 8086 -o /tracy_profiles/otterstax.tracy -f
@@ -590,10 +588,10 @@ if $TRACY_SEP; then
         # fresh restart above re-registers them automatically.
 
         # Start a dedicated tracy-capture sidecar for this test.
-        SEP_CAPTURE="tracy-sep-${PROJECT_NAME}-$$-$((SEP_PASSED + SEP_FAILED))"
+        SEP_CAPTURE="tracy-sep-${COMPOSE_PROJECT_NAME}-$$-$((SEP_PASSED + SEP_FAILED))"
         docker run -d \
             --name "$SEP_CAPTURE" \
-            --network "${PROJECT_NAME}_test_app_network" \
+            --network "${COMPOSE_PROJECT_NAME}_test_app_network" \
             -v "$TRACY_OUTPUT_DIR:/tracy_profiles" \
             "otterstax_app:${IMAGE_TAG:-latest}" \
             tracy-capture -a test-otterstax -p 8086 -o "/tracy_profiles/${tracy_out}" -f
@@ -679,50 +677,53 @@ else
     TEST_RC=1
 fi
 
-#TODO: temporary disabled
-#if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
-#    echo ""
-#    echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="
-#    echo ""
-#
-#    echo "♻️  Recreating test-otterstax for a clean data dir..."
-#    compose rm -sf test-otterstax >/dev/null 2>&1 || true
-#    compose up -d test-otterstax
-#
-#    echo "🕒 Waiting for otterstax to be healthy..."
-#    _crash_ready=false
-#    for ((i=1;i<=WAIT_RETRIES;i++)); do
-#        if compose_exec test-otterstax bash -c 'exec 3<>/dev/tcp/localhost/8815' >/dev/null 2>&1; then
-#            echo "✅ Otterstax is healthy"
-#            _crash_ready=true
-#            break
-#        fi
-#        sleep ${WAIT_SLEEP}
-#    done
-#
-#    if ! $_crash_ready; then
-#        echo "❌ otterstax not healthy before crash test"
-#        compose logs test-otterstax | tail -30
-#        TEST_RC=1
-#    else
-        # `set -e` is active: a non-zero exit here would abort the script before
-        # the log dump + Step 9 cleanup below (leaving containers running). Capture
-        # the rc via `|| _crash_rc=$?` so failure is handled, not fatal.
-#        _crash_rc=0
-#        compose run --rm --use-aliases \
-#            -v /var/run/docker.sock:/var/run/docker.sock \
-#            test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app \
-#            || _crash_rc=$?
-#        if [ $_crash_rc -eq 0 ]; then
-#            echo "✅ PASSED: Kafka crash-recovery"
-#        else
-#            echo "❌ FAILED: Kafka crash-recovery (exit code $_crash_rc)"
-#            echo "--- otterstax logs (last 40 lines) ---"
-#            compose logs test-otterstax 2>/dev/null | tail -40
-#            TEST_RC=1
-#        fi
-#    fi
-#fi
+if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
+    echo ""
+    echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="
+    echo ""
+
+    echo "♻️  Recreating test-otterstax for a clean data dir..."
+    # Capture setup and test failures so Step 9 still cleans up under set -e.
+    _crash_rc=0
+    compose rm -sf test-otterstax >/dev/null || _crash_rc=$?
+    if [ "$_crash_rc" -eq 0 ]; then
+        compose up -d test-otterstax || _crash_rc=$?
+    fi
+
+    if [ "$_crash_rc" -eq 0 ]; then
+        echo "🕒 Waiting for otterstax to be healthy..."
+        _crash_ready=false
+        for ((i=1;i<=WAIT_RETRIES;i++)); do
+            if compose_exec test-otterstax bash -c 'exec 3<>/dev/tcp/localhost/8815' >/dev/null 2>&1; then
+                echo "✅ Otterstax is healthy"
+                _crash_ready=true
+                break
+            fi
+            sleep ${WAIT_SLEEP}
+        done
+
+        if $_crash_ready; then
+            compose run --rm --use-aliases \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app \
+                || _crash_rc=$?
+        else
+            echo "❌ otterstax not healthy before crash test"
+            _crash_rc=1
+        fi
+    else
+        echo "❌ Could not recreate test-otterstax for the crash test"
+    fi
+
+    if [ "$_crash_rc" -eq 0 ]; then
+        echo "✅ PASSED: Kafka crash-recovery"
+    else
+        echo "❌ FAILED: Kafka crash-recovery (exit code $_crash_rc)"
+        echo "--- otterstax logs (last 40 lines) ---"
+        compose logs --tail 40 test-otterstax || true
+        TEST_RC=1
+    fi
+fi
 
 echo ""
 echo "=== Step 8d: Spark Connect client matrix ==="
@@ -791,7 +792,6 @@ echo ""
 echo "=== Step 9: Cleanup ==="
 echo ""
 compose down --volumes --remove-orphans
-rm -rf .volumes 2>/dev/null || true
 
 echo "✅ Tests completed."
 

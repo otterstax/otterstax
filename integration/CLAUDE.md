@@ -9,8 +9,8 @@ sources:
 
 | Directory | Class | What |
 |-----------|-------|------|
-| `s3/` | `db::S3Manager` | S3 object loads / exports over the s3 connector and the file manager (below) |
-| `kafka/` | `otterstax::kafka::KafkaManager` | librdkafka consumers / producers + Kafka SOURCE / STREAM objects (own library `kafka_runtime`; see `kafka/CLAUDE.md`) |
+| `integration/s3/` | `db::S3Manager` | S3 object loads / exports over the s3 connector and the file manager (below) |
+| `integration/kafka/` | `otterstax::kafka::KafkaManager` | librdkafka consumers / producers + Kafka SOURCE / STREAM objects (own library `kafka_runtime`; see `integration/kafka/CLAUDE.md`) |
 
 Remote SQL backends are not here: a remote table's statements are the federation's backend actor and
 its agents (`otterbrix/federation/CLAUDE.md`) over the connectors (`connectors/CLAUDE.md`).
@@ -19,7 +19,7 @@ engine has no actor of OtterStax's own: every engine request is a free function 
 `otterbrix/operators/engine_requests.hpp` sent straight to the engine dispatcher
 (`runtime::engine_t::dispatcher_address()`).
 
-## S3Manager (`s3/`)
+## S3Manager (`integration/s3/`)
 
 `db::S3Manager` orchestrates object I/O by bridging the raw S3 connector (`conn::s3::ConnectorManager`)
 and the file connector (`conn::file::FileManager`). It moves bytes only; the query session does the
@@ -46,6 +46,6 @@ against RustFS, `tests/test_mysql_s3_stream.py`.
 
 Its handlers `co_await` the cross-actor sends rather than `.take_ready()`, so they stay correct if those
 callees move off the synchronous `enqueue_impl` path. End-to-end coverage lives in the python
-integration suite (`tests/test_{schema_}mysql_s3.py`, `tests/test_mysql_join_sql_s3_to_s3.py`,
+integration suite (`tests/test_{mysql,schema_mysql}_s3.py`, `tests/test_mysql_join_sql_s3_to_s3.py`,
 `tests/test_mysql_join_otb_local_s3.py`, `tests/test_mysql_join_otb_local_s3_file.py` — s3 parquet ⋈
 file csv ⋈ otterbrix-internal), driven by `docker-run-tests.sh`.

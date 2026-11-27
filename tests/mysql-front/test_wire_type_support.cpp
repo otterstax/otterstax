@@ -9,16 +9,9 @@
 // it builds a resultset, so an unsupported column becomes a protocol error and
 // never a dropped socket.
 //
-// DECIMAL and HUGEINT are the types whose answer differs per format rather than
-// per type: both are carried on the MySQL wire in both formats and on the
-// PostgreSQL wire in text, and refused in PostgreSQL binary alone. A DECIMAL's
-// value is assembled from the stored unscaled integer and the scale of its
-// type, so the cases below pin the digits for every storage width (INT16 …
-// INT128) and both signs; a HUGEINT is the same rendering at scale 0 — neither
-// wire has a 128-bit integer type, and the fixed-point type each of them does
-// have (NEWDECIMAL, NUMERIC) carries every value of one exactly, the ends of the
-// range included. `uhugeint` is mapped by neither and stands here for the
-// refusal path every unmapped type takes.
+// DECIMAL and HUGEINT use MySQL NEWDECIMAL or PostgreSQL NUMERIC in either
+// format. These tests cover each DECIMAL storage width and the full signed
+// HUGEINT range. UHUGEINT has no wire type on either protocol.
 
 #include "frontend/common/resultset_utils.hpp"
 #include "frontend/common/utils.hpp"
@@ -666,8 +659,7 @@ TEST_CASE("pg resultset: a HUGEINT column is a NUMERIC field whose text keeps ev
 }
 
 TEST_CASE("unsupported_column_message names the column, its type and the format") {
-    // The two refusals that actually occur: a HUGEINT asked for in PostgreSQL
-    // binary, and a UHUGEINT, which no format of either wire carries.
+    // Use synthetic column errors to check message formatting.
     unsupported_column hugeint_in_binary{"big", LT::HUGEINT, result_encoding::BINARY};
 
     auto pg = unsupported_column_message<frontend_type::POSTGRES>(hugeint_in_binary);

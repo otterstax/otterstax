@@ -38,15 +38,16 @@ service:
 
 # Remote backends + s3 aliases. All sections are optional. `port` is a string;
 # a postgresql `schema` limits the connection to that schema (empty: every user
-# schema of the database); `table` limits the startup discovery to that table
-# (a table first used later is still found); `pool_size` (default 4) is the
+# schema of the database); `table` limits discovery to that table both at
+# startup and on first use. `pool_size` (default 4) is the number of
 # connections kept open to a backend — a transaction block holds one until it
 # ends; s3 region/session_token/endpoint are optional. The `alias` is the
-# outermost qualifier in federated SQL — a remote table is always four parts,
-# alias.database.schema.table, the schema `public` on mysql / clickhouse (three
-# parts name a local table) — and the s3_alias used by CREATE EXTERNAL TABLE /
-# COPY. A backend alias is lower-case letters, digits and `_`, not starting with
-# a digit; `federation` and `main` (any case) are reserved: no alias may take them.
+# outermost qualifier of a remote name: alias.namespace.table. The namespace
+# is a PostgreSQL schema or a MySQL/ClickHouse database. Local tables use
+# local.namespace.table. An S3 alias is used by CREATE EXTERNAL TABLE and COPY.
+# A backend alias starts with a lowercase letter or underscore and can contain
+# lowercase letters, digits, and underscores. The names `local`, `federation`,
+# and `main` are reserved in every section, regardless of case.
 connections:
   mysql:
     - alias: mysql

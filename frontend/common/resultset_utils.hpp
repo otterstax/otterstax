@@ -36,13 +36,8 @@ namespace frontend {
         result_encoding encoding;
     };
 
-    // True iff get_field_type maps `type` AND the encoder of `encoding` has a
-    // case for it. The text encoder covers NA, the scalars, DECIMAL, HUGEINT,
-    // ENUM, ARRAY, LIST and STRUCT; the binary one NA, the scalars, and
-    // DECIMAL/HUGEINT on the MySQL wire alone — which is why this is answered
-    // per frontend and not per type. What a nested type holds is checked by
-    // find_unsupported_column (every element and field must have a text
-    // rendering of its own).
+    // Requires a wire type mapping and an encoder for the requested format.
+    // find_unsupported_column also checks the elements and fields of nested types.
     template<frontend_type front_type>
     bool is_encodable(components::types::logical_type type, result_encoding encoding);
 
@@ -59,7 +54,6 @@ namespace frontend {
     std::optional<unsupported_column> find_unsupported_column(const components::vector::data_chunk_t& chunk,
                                                               const std::vector<result_encoding>& format);
 
-    // "column 'big' has type HUGEINT, which the PostgreSQL wire cannot encode in text format"
     template<frontend_type front_type>
     std::string unsupported_column_message(const unsupported_column& column);
 

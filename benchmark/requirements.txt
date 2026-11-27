@@ -1,0 +1,17 @@
+# Client libraries of the benchmark image (benchmark/Dockerfile.benchmark).
+# Names only: the versions are the integration image's, taken from
+# tests/requirements-client.txt as constraints, so the two images cannot diverge.
+# A package that file does not pin carries its own == here
+# (scripts/check_pins.sh refuses a bare name nothing pins).
+-c ../tests/requirements-client.txt
+
+mysql-connector-python
+psycopg2-binary
+flightsql-dbapi
+pyarrow
+PyMySQL
+clickhouse-driver
+confluent-kafka
+Faker
+# Benchmark only (bench.yaml):
+PyYAML==6.0.3

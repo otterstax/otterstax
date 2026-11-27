@@ -131,7 +131,7 @@ require_server() {
     fail "otterstax PG wire not reachable at ${PGHOST_}:${PGPORT_} (psql exit ${rc})"
     _indent "${out}"
     echo "       start the server first (examples/demo/up.sh, or with --local:" \
-         "./build/server --config examples/demo/config_local.yaml)" >&2
+         "./build/Release/server --config examples/demo/config_local.yaml)" >&2
     return 1
 }
 

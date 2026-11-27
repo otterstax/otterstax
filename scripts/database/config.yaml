@@ -1,5 +1,5 @@
 # Server config for the manual/dev stack (root compose.yml). Mounted into the
-# otterstax_app container at the server's default config path and read once at
+# otterstax_app container at /otterstax/config.yaml and read once at
 # startup. Backends are addressed by docker-DNS names on the compose network.
 
 service:

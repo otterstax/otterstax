@@ -37,18 +37,13 @@ status=0
 PGPASSWORD="$PASS" psql -P pager=off \
     "postgresql://${USER}@${HOST}:${PORT}/${DB}" "$@" || status=$?
 
-# psql exit code 2 == connection could not be established or was lost mid-query.
-# On OtterStax that usually means the engine isn't up, or a query SIGSEGV'd it.
+# psql exit code 2 means a failed or lost connection in non-interactive mode.
 if [ "$status" -eq 2 ]; then
     echo "" >&2
     echo "⚠️  OtterStax connection failed or was lost (psql exit 2)." >&2
     echo "    'database \"…\" does not exist' (3D000): set OTTERSTAX_DB to a place —" >&2
     echo "    local, local.ns, a connection alias or alias.ns (default: local)." >&2
-    echo "    Otherwise the engine is down or a query crashed it (some federated" >&2
-    echo "    queries can SIGSEGV the server — see SKILL.md 'Engine crashes')." >&2
-    echo "    Recover: restart the server (a plain restart may crash-loop on WAL" >&2
-    echo "    replay — recreate the process/container fresh). The server registers" >&2
-    echo "    the connections declared in its config.yaml at startup; nothing to" >&2
-    echo "    re-register by hand." >&2
+    echo "    Check OTTERSTAX_HOST and OTTERSTAX_PORT. Try a new connection with SELECT 1." >&2
+    echo "    If the connection was lost during a query, check the server logs." >&2
 fi
 exit "$status"

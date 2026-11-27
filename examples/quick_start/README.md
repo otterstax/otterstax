@@ -1,9 +1,9 @@
 # OtterStax Quick Start
 
-A one-command federated-SQL demo. `docker compose up` brings up **2 PostgreSQL + 1
+A one-command federated-SQL demo. `docker compose up --wait` brings up **2 PostgreSQL + 1
 MariaDB + 1 ClickHouse + RustFS (S3) + Kafka** behind a single OtterStax server; you run
-SQL that joins across all of them with `psql`. All data is pre-seeded from committed
-files — no scripts.
+SQL that joins across all of them with `psql`. Compose seeds the data from committed
+files automatically.
 
 The 9 core examples cover federated SQL over the databases + S3; the
 [**Kafka (streaming)**](#kafka-streaming) section adds four streaming examples on top.
@@ -12,25 +12,29 @@ The 9 core examples cover federated SQL over the databases + S3; the
 
 ```bash
 cd examples/quick_start
-docker compose up -d
+docker compose up --wait
 ```
 
-First run pulls the `ghcr.io/otterstax/otterstax:0.2.0` image and seeds every backend from
-`init/`. Wait until all report `healthy` (~30–60 s):
+Use this command for initial setup or to load the demo fixtures again.
+On an existing stack, a full `up --wait` can rerun the seed jobs even
+without `down`. They recreate the demo Kafka topics and clear S3 exports.
+To resume a paused stack with its data, use the [pause and resume commands](#teardown).
+
+Compose pulls `ghcr.io/otterstax/otterstax:0.2.0` (Linux amd64) if it is missing.
+To supply a locally built runtime image, see [Running with Docker Compose](../../readme.md#running-with-docker-compose).
+OtterStax starts after both the S3 and Kafka seed jobs succeed. The command
+returns once the server is healthy. Confirm the PostgreSQL wire answers a query:
 
 ```bash
-docker compose ps
+psql -h localhost -p 8817 -U demo local -c "SELECT 1"
 ```
 
-```text
-NAME                  STATUS
-qs-clickhouse         Up (healthy)
-qs-kafka              Up (healthy)
-qs-mariadb            Up (healthy)
-qs-rustfs             Up (healthy)
-qs-otterstax          Up (healthy)
-qs-postgres-catalog   Up (healthy)
-qs-postgres-shop      Up (healthy)
+If startup reports a failed seed job, inspect its logs before running the
+examples:
+
+```bash
+docker compose ps -a
+docker compose logs qs-rustfs-init qs-kafka-init
 ```
 
 Connect to OtterStax (no password; the database is the engine's `local` — a name that is
@@ -157,8 +161,9 @@ backend table.
 
 - **Docker** (Desktop or Engine) running.
 - **`psql`** on your host (the PostgreSQL client) — that's the only client you need.
-- Free host ports: **8817** (OtterStax) and **3310–3317** (backends + RustFS). Port
-  **19094** (Kafka) is published too but only needed for optional host-side `rpk`.
+- Free host ports: **8817** (OtterStax), **3310–3317** (backends and RustFS),
+  and **19094** (Kafka). Compose publishes 19094 even if you use `rpk` inside
+  the broker container.
 - `mysql` / `clickhouse-client` are **optional** — this guide uses `docker exec` for those.
 
 ---
@@ -197,12 +202,19 @@ docker exec qs-clickhouse clickhouse-client -u demo --password demo \
 
 ### Verify the S3 files (RustFS console)
 
+Before example 6, wait for the seed job to exit and inspect its logs:
+
+```bash
+docker compose ps -a qs-rustfs-init
+docker compose logs qs-rustfs-init
+```
+
 Open **http://localhost:3317/rustfs/console/** and log in with **`rustfsadmin` / `rustfsadmin`**.
-Browse the `quickstart-bucket` — at a fresh start it holds exactly the three source
-objects `regions.csv`, `product_costs.parquet` and `promotions.ndjson`.
+Verify that `quickstart-bucket` contains all three source objects:
+`regions.csv`, `product_costs.parquet` and `promotions.ndjson`. An upload
+error fails the startup command. Check the logs for the failure details.
 [Example 7](#example-7--export-a-join-back-to-s3-copy--to) writes an
-`exports/promo_costs.csv`; that `exports/` prefix is demo output, so the seed job
-clears it on every `docker compose up` — you'll only see it after you run example 7.
+`exports/promo_costs.csv`. The seed job clears `exports/` whenever the job runs.
 
 ---
 
@@ -210,9 +222,17 @@ clears it on every `docker compose up` — you'll only see it after you run exam
 
 Nine progressive examples, simple → advanced. Each shows: **purpose**, a
 **copy-paste command**, and the **expected result** (trimmed small). Every example is
-also a file under `sql/` — run it with `-f examples/quick_start/sql/<file>`.
+also a file under `examples/quick_start/sql/`. For example:
 
-Run them from the repo root (or any directory — the commands are self-contained).
+```bash
+# From examples/quick_start
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local -f sql/01_select.sql
+# From the repository root
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local -f examples/quick_start/sql/01_select.sql
+```
+
+Batch examples use `ON_ERROR_STOP=1` so `psql` stops and returns a nonzero
+status on the first SQL error. Statements already committed remain in effect.
 
 ---
 
@@ -229,13 +249,13 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- product_id |       name        | category |   price
-------------+-------------------+----------+------------
- P0399      | Star Security     | Toys     | 498.590000
- P0446      | Station Determine | Books    | 495.930000
- P0184      | Suggest Player    | Beauty   | 491.030000
- P0269      | Good As           | Sports   | 490.570000
- P0335      | Such Green        | Toys     | 488.940000
+ product_id |       name        | category | price
+------------+-------------------+----------+--------
+ P0399      | Star Security     | Toys     | 498.59
+ P0446      | Station Determine | Books    | 495.93
+ P0184      | Suggest Player    | Beauty   | 491.03
+ P0269      | Good As           | Sports   | 490.57
+ P0335      | Such Green        | Toys     | 488.94
  ... (7 rows)
 ```
 
@@ -256,12 +276,12 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
-  status  |  n  |     total
-----------+-----+---------------
- paid     | 684 | 190897.860000
- shipped  | 157 |  42808.090000
- pending  | 103 |  30693.640000
- refunded |  56 |  16341.030000
+  status  |  n  |       total
+----------+-----+--------------------
+ paid     | 684 | 190897.86000000004
+ shipped  | 157 |           42808.09
+ pending  | 103 | 30693.639999999996
+ refunded |  56 |           16341.03
  (4 rows)
 ```
 
@@ -283,13 +303,13 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
-      name       | country | orders_cnt |    spend
------------------+---------+------------+-------------
- Connie Parker   | NL      |          4 | 1486.560000
- Daniel Cain     | FR      |          4 | 1437.210000
- Sandra Boyd     | DE      |          4 | 1343.680000
- James Rivera    | JP      |          5 | 1331.140000
- Anthony Preston | CA      |          4 | 1285.190000
+      name       | country | orders_cnt |       spend
+-----------------+---------+------------+--------------------
+ Connie Parker   | NL      |          4 | 1486.5600000000002
+ Daniel Cain     | FR      |          4 |            1437.21
+ Sandra Boyd     | DE      |          4 | 1343.6799999999998
+ James Rivera    | JP      |          5 | 1331.1399999999999
+ Anthony Preston | CA      |          4 |            1285.19
  ... (10 rows)
 ```
 
@@ -313,13 +333,13 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- category | country |   revenue
-----------+---------+-------------
- Toys     | FR      | 4950.610000
- Sports   | DE      | 4577.540000
- Books    | FR      | 4432.880000
- Food     | US      | 4338.800000
- Home     | JP      | 4111.880000
+ category | country |      revenue
+----------+---------+--------------------
+ Toys     | FR      |            4950.61
+ Sports   | DE      |  4577.540000000001
+ Books    | FR      |  4432.880000000001
+ Food     | US      |             4338.8
+ Home     | JP      |  4111.879999999999
  ... (10 rows)
 ```
 
@@ -348,19 +368,21 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- channel | category | orders_cnt |   revenue
----------+----------+------------+-------------
- social  | Books    |         19 | 6314.470000
- mobile  | Food     |         22 | 6242.420000
- social  | Home     |         16 | 6175.340000
- web     | Toys     |         16 | 5574.930000
- web     | Food     |         18 | 5522.360000
+ channel | category | orders_cnt |      revenue
+---------+----------+------------+-------------------
+ social  | Books    |         19 | 6314.469999999999
+ mobile  | Food     |         22 | 6242.419999999999
+ social  | Home     |         16 |           6175.34
+ web     | Toys     |         16 |           5574.93
+ web     | Food     |         18 |           5522.36
  ... (10 rows)
 ```
 
 ---
 
 ### Example 6 — Load 3 S3 files into the engine (csv + parquet + ndjson)
+
+First [verify the three S3 source objects](#verify-the-s3-files-rustfs-console).
 
 Loads three S3 objects — one of each format — into OtterStax-internal tables, then joins
 one of them (`local.qs.regions`) to a live backend (`customers`). The tables go into the
@@ -369,7 +391,7 @@ schema `qs` of the local database (`local.qs.regions`);
 **format is auto-detected** from each file's extension (no `format` option needed):
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 CREATE SCHEMA IF NOT EXISTS qs;
 CREATE EXTERNAL TABLE local.qs.regions       WITH (s3_alias = 'qs_s3', location = 's3://quickstart-bucket/regions.csv');
 CREATE EXTERNAL TABLE local.qs.product_costs WITH (s3_alias = 'qs_s3', location = 's3://quickstart-bucket/product_costs.parquet');
@@ -384,6 +406,7 @@ SQL
 ```
 
 ```text
+CREATE SCHEMA
 COMMAND
 COMMAND
 COMMAND
@@ -453,13 +476,13 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- country | category | channel | orders_cnt |   revenue   | gross_margin
----------+----------+---------+------------+-------------+--------------
- IL      | Food     | mobile  |          7 | 2135.550000 |  1515.310000
- ES      | Beauty   | web     |          3 | 1731.790000 |  1125.560000
- FR      | Books    | social  |          5 | 1928.670000 |  1084.870000
- US      | Clothing | mobile  |          7 | 1882.940000 |  1071.430000
- ES      | Food     | social  |          2 | 1689.110000 |  1037.890000
+ country | category | channel | orders_cnt |      revenue       |    gross_margin
+---------+----------+---------+------------+--------------------+--------------------
+ IL      | Food     | mobile  |          7 | 2135.5499999999997 | 1515.3100000000002
+ ES      | Beauty   | web     |          3 | 1731.7900000000002 |            1125.56
+ FR      | Books    | social  |          5 |            1928.67 | 1084.8700000000001
+ US      | Clothing | mobile  |          7 |            1882.94 |            1071.43
+ ES      | Food     | social  |          2 |            1689.11 | 1037.8899999999999
  ... (10 rows)
 ```
 
@@ -474,7 +497,7 @@ psql -h localhost -p 8817 -U demo local \
 A full lifecycle on a small engine table (requires example 6 for the `qs` schema):
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 CREATE TABLE local.qs.scratch (id bigint, label string, qty bigint);
 INSERT INTO local.qs.scratch (id, label, qty) VALUES (1,'alpha',1), (2,'beta',2), (3,'gamma',3);
 UPDATE local.qs.scratch SET qty = qty * 10 WHERE id <= 2;
@@ -498,13 +521,15 @@ DROP
 ```
 
 > `UPDATE 2` is the number of rows the `UPDATE` changed; the table is the final
-> `SELECT`. `DELETE` works the same way and reports `DELETE N`. These run on **engine tables** (`local.qs.*`, incl. the S3-loaded ones), which
-> are the reliably writable target — mutations directly against the pre-seeded backend
-> tables (`customers`, `orders`, …) are not supported over this path.
+> `SELECT`. `DELETE` works the same way and reports `DELETE N`. Example 9
+> modifies only `local.qs.scratch`. Supported remote mutations run on the
+> backend, so treat the demo backend tables (`customers`, `orders`, …) as
+> read-only during the walkthrough.
 >
-> Engine tables live inside the OtterStax container: they survive `docker compose restart`
-> but not `docker compose down` — after a `down`/`up` just re-run example 6. Backend data
-> and S3 files always persist (see [Persistence](#persistence--what-survives-a-restart)).
+> Engine tables live inside the OtterStax container. They survive restarting
+> `qs-otterstax`, and `docker compose down` removes them. After a `down`/`up`,
+> re-run example 6 to rebuild the demo tables. See [Persistence](#persistence--what-survives-a-restart)
+> for what happens to backend volumes, S3 objects and Kafka.
 
 ---
 
@@ -515,16 +540,48 @@ events on the `qs_orders` topic. These four examples turn a topic into a SQL tab
 it to the live backends, produce to it from SQL, and continuously transform it — all over
 the same `psql` connection. `TRANSACTIONAL=true` makes ingest/produce **exactly-once**.
 
+### Verify the Kafka input
+
+Before K1, wait for the seed job to exit, inspect its log and check the input
+topic itself:
+
+```bash
+docker compose ps -a qs-kafka-init
+docker compose logs qs-kafka-init
+docker compose exec -T qs-kafka rpk -X brokers=qs-kafka:9092 topic describe qs_orders -p
+```
+
+On a fresh stack, partition 0 should show log start offset 0 and high
+watermark 40. If the topic is missing or the offsets differ on a fresh stack,
+check the seed log for errors.
+
 > **Ingestion is asynchronous.** After `CREATE SOURCE` a background poller fills the
 > table over a few seconds — if a `SELECT` shows 0 rows, wait and re-run it.
 
-### K1 — A Kafka topic as a SQL table
-
-Declare the source (broker is the in-network `qs-kafka:9092`):
+If you re-seeded Kafka while keeping the OtterStax container, K1 can retain
+rows and offsets from the previous topic. The transactional source resumes
+from the latest offset stored in OtterStax for each partition:
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
-DROP SOURCE IF EXISTS qs_orders CASCADE;
+psql -h localhost -p 8817 -U demo local \
+  -c 'SELECT partition_id, max(committed_offset) AS next_offset
+      FROM federation.kafka.qs_orders__offsets GROUP BY partition_id;'
+```
+
+Compare those offsets with the topic's log start and high watermark above.
+For example, a saved offset of 43 is past the end of a re-seeded topic whose
+high watermark is 40. Even matching offsets do not prove that the retained
+rows came from the new topic. If you want K1 to read the freshly seeded data
+from the beginning, use the [explicit Kafka cleanup](#kafka-cleanup--re-running),
+then recreate the source with a fresh `GROUP_ID` and `OFFSET_RESET = 'earliest'`.
+
+### K1 — A Kafka topic as a SQL table
+
+On the first run, declare the source (broker is the in-network
+`qs-kafka:9092`). If it already exists, use the SELECTs below to check it.
+
+```bash
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 CREATE SOURCE qs_orders (
     event_id VARCHAR, customer_id VARCHAR, product_id VARCHAR,
     amount DOUBLE, status VARCHAR, channel VARCHAR
@@ -551,12 +608,12 @@ psql -h localhost -p 8817 -U demo local \
 --------
      40
 
-  status  | n  |    total
-----------+----+-------------
- paid     | 27 | 6664.250000
- pending  |  6 |  888.410000
- shipped  |  4 |  955.640000
- refunded |  3 | 1082.510000
+  status  | n  |       total
+----------+----+-------------------
+ paid     | 27 | 6664.249999999998
+ pending  |  6 | 888.4100000000001
+ shipped  |  4 | 955.6400000000001
+ refunded |  3 |           1082.51
 ```
 
 ### K2 — Federated JOIN: live Kafka ⋈ PostgreSQL ×2
@@ -575,18 +632,19 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- event_id | country |  tier  |  category   |   amount
-----------+---------+--------+-------------+------------
- E0025    | US      | bronze | Food        | 488.980000
- E0030    | FR      | bronze | Electronics | 468.200000
- E0018    | AU      | bronze | Beauty      | 397.650000
- E0003    | BR      | silver | Toys        | 379.800000
- E0034    | IL      | bronze | Clothing    | 374.090000
+ event_id | country |  tier  |  category   | amount
+----------+---------+--------+-------------+--------
+ E0025    | US      | bronze | Food        | 488.98
+ E0030    | FR      | bronze | Electronics |  468.2
+ E0018    | AU      | bronze | Beauty      | 397.65
+ E0003    | BR      | silver | Toys        |  379.8
+ E0034    | IL      | bronze | Clothing    | 374.09
  ... (10 rows)
 ```
 
-> `customers` and `products` both have a `name` column; referencing `name` in this mixed
-> 3-way join trips column resolution, so this projects `country`/`tier`/`category` instead.
+> `customers` and `products` both have a `name` column; a bare `name` in this mixed
+> 3-way join is ambiguous (`path: 'name' is ambiguous. Use aliases or full path`), so
+> this projects `country`/`tier`/`category` instead — a qualified `c.name` works fine.
 
 ### K3 — Produce to Kafka from SQL (round-trip)
 
@@ -608,10 +666,10 @@ psql -h localhost -p 8817 -U demo local \
 ```
 
 ```text
- event_id | customer_id |   amount   | status  | channel
-----------+-------------+------------+---------+---------
- E9001    | C0001       | 199.990000 | paid    | api
- E9002    | C0002       |  49.500000 | pending | api
+ event_id | customer_id | amount | status  | channel
+----------+-------------+--------+---------+---------
+ E9001    | C0001       | 199.99 | paid    | api
+ E9002    | C0002       |   49.5 | pending | api
 ```
 
 ### K4 — Continuous stream (`CREATE STREAM … AS SELECT`)
@@ -620,7 +678,7 @@ Spawn a persistent worker that filters `qs_orders` to paid rows and produces the
 `qs_orders_paid` topic, forever:
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 DROP STREAM IF EXISTS qs_orders_paid;
 CREATE STREAM qs_orders_paid
     WITH (KAFKA_TOPIC       = 'qs_orders_paid',
@@ -634,35 +692,63 @@ CREATE STREAM qs_orders_paid
 SQL
 ```
 
-Verify the output topic (drain it via `rpk` inside the broker; `-o :end` reads to the end
-and exits):
+Verify the output topic (drain it via `rpk` inside the broker; `-o :end` reads to the
+current end and exits; `--read-committed` reads only committed records — a plain consume
+can also show the records of an open or aborted transaction, and with
+`TRANSACTIONAL = true` the stream commits its writes):
 
 ```bash
-docker exec qs-kafka rpk topic consume qs_orders_paid -o :end -f '%v\n'
+docker exec qs-kafka rpk topic consume qs_orders_paid -o :end -f '%v\n' --read-committed
 ```
+
+`-o :end` is the end at the moment `rpk` starts, so a run soon after `CREATE STREAM`
+can show a partial result — re-run it once the stream has worked through the input.
+Expect 27 paid records on a fresh stack; one run of K3 adds `E9001` and makes it 28
+(the sample below is that state):
 
 ```text
 {"event_id":"E0001","customer_id":"C0540","amount":2.1553E2,"channel":"mobile"}
 {"event_id":"E0002","customer_id":"C0539","amount":2.8616E2,"channel":"social"}
 {"event_id":"E0003","customer_id":"C0343","amount":3.798E2,"channel":"email"}
-... (28 paid records — the paid subset of qs_orders)
+... (28 paid records — the paid subset of qs_orders plus K3's E9001)
 ```
 
 ### Kafka cleanup / re-running
 
-`DROP` the stream + source before replaying K1–K4:
+Use these commands to remove the SQL stream and source:
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 DROP STREAM IF EXISTS qs_orders_paid;
 DROP SOURCE IF EXISTS qs_orders;
 SQL
 ```
 
-Like the engine tables, a source/stream lives inside the OtterStax container: it survives
-`docker compose restart` (and resumes) but not `docker compose down` — after a `down`/`up`
-re-run K1 (and K4). The `qs_orders` topic itself is re-seeded to the
-committed 40 events on every `docker compose up`.
+Dropping the source removes its materialized table and local read offsets.
+The plain DROP refuses if other dependencies remain. For a full reset,
+`DROP SOURCE IF EXISTS qs_orders CASCADE` also removes dependent views,
+streams and continuous `INSERT … SELECT` queries, including ones you added.
+Check where the replacement source should resume before recreating it.
+
+Dropping the SQL objects leaves the broker's topics and committed group
+offsets in place. Recreating K4 with the same stream name uses the same
+default group, `otterstax_stream_qs_orders_paid`. `OFFSET_RESET = 'earliest'`
+only applies when there is no usable committed offset.
+
+For a clean K4 replay from the start of the retained input, choose a fresh
+`GROUP_ID` and an empty output topic. For example, create
+`qs_orders_paid_replay`, set K4's `KAFKA_TOPIC` to it, add
+`GROUP_ID = 'qs_orders_paid_replay'` in the `WITH` clause and read that topic
+when verifying the result. Choose new names for subsequent replays. A replay
+reads the retained input, including rows added by K3 if you ran it.
+
+```bash
+docker compose exec -T qs-kafka rpk -X brokers=qs-kafka:9092 topic create qs_orders_paid_replay -p 1
+```
+
+Restarting only OtterStax preserves the SQL definitions and broker offsets.
+After `down`/`up`, successful seeding restores the demonstration topics
+from the fixtures. Re-run K1 and K4 to recreate the SQL objects.
 
 ---
 
@@ -670,54 +756,67 @@ committed 40 events on every `docker compose up`.
 
 Examples 1–5 are read-only and always re-runnable. Examples 6–9 create the `local.qs.*`
 engine tables. **Run example 6 once** — re-running `CREATE EXTERNAL TABLE` on a table
-that already exists fails with `… local.qs.regions already exists` and leaves the table as it
-was. Before replaying examples 6–9, drop the engine state:
+that already exists fails with `ERROR: CREATE EXTERNAL TABLE failed: collection already
+exists` — the engine names the collection, not the table — and leaves the table as it
+was. Before replaying examples 6–9, drop just the three demo tables:
 
 ```bash
-psql -h localhost -p 8817 -U demo local <<'SQL'
+psql -v ON_ERROR_STOP=1 -h localhost -p 8817 -U demo local <<'SQL'
 DROP TABLE IF EXISTS local.qs.regions;
 DROP TABLE IF EXISTS local.qs.product_costs;
 DROP TABLE IF EXISTS local.qs.promotions;
-DROP SCHEMA IF EXISTS qs CASCADE;
 SQL
 ```
 
-This drops `local.qs.regions`, `local.qs.product_costs`, `local.qs.promotions` and the `qs` schema.
-Backend data and S3 files are untouched. (The `exports/promo_costs.csv` object from
-example 7 lives in S3 and is simply overwritten on the next run.)
+If example 9 was interrupted, `local.qs.scratch` may still exist. Check that
+it belongs to the walkthrough before running `DROP TABLE local.qs.scratch`.
+If it is your own table, choose a different unused name throughout example 9.
+
+For a **full reset of `local.qs`**, run `DROP SCHEMA IF EXISTS qs CASCADE` — that one
+statement is all `examples/quick_start/sql/cleanup.sql` does. CASCADE removes the schema
+and all its objects, including any you added, **and dependent objects in other schemas**:
+a view that reads a `local.qs` table is dropped with it. The three plain `DROP TABLE`s
+above are the surgical route and can themselves be refused while such a dependency
+exists (with `ON_ERROR_STOP=1` the script stops there). SQL cleanup leaves backend data
+and S3 objects in place. Example 7 overwrites its export when you run it again.
 
 ---
 
 ## Persistence — what survives a restart
 
-Backend data lives in named Docker volumes and the S3 objects live in RustFS's volume,
-so **your data is intact across restarts**. Verified behavior:
+| Action | Backend databases | RustFS | OtterStax and Kafka |
+|--------|-------------------|--------|--------------------|
+| `docker compose restart qs-otterstax` | Kept | Kept | Container state and broker offsets kept |
+| `docker compose stop` | Volumes kept | Objects kept | Containers kept, including engine data and broker state |
+| Full `docker compose up --wait` on an existing stack | Named volumes kept | Seed reruns overwrite the three source objects and delete `exports/` | Seed reruns recreate the demo topics. The local SQL objects can still exist if the OtterStax container is reused |
+| `docker compose down` then `up` | Named volumes kept | Volume kept. The seed job overwrites the three source objects and deletes `exports/` | Local catalog, tables, Kafka SQL definitions and local offsets discarded. The broker is recreated and the demo topics re-seeded |
+| `docker compose down -v` then `up` | Volumes deleted. Demo data rebuilt from fixtures | Volume deleted. Seed objects restored | Same engine and broker reset as `down` |
 
-| Action | Backends (customers/products/orders/pageviews) | S3 source files | Engine tables (`local.qs.*`) |
-|--------|-----------------------------------------------|-----------------|------------------------|
-| `docker compose restart` / `stop`+`start` | **kept** (volumes) | **kept** | **kept** (the container's storage survives) |
-| `docker compose down` then `up` (no `-v`) | **kept** (volumes) | **kept** (rustfs-init re-runs, idempotent) | lost (container recreated) — re-run ex. 6 |
-| `docker compose down -v` then `up` | **rebuilt from `init/**`** (identical data) | **re-seeded from `init/s3/**`** | absent until ex. 6 |
-
-So: source data (all four backends + the three S3 **source** files) is preserved on a warm
-restart and faithfully **reconstructed from the committed init files** on a cold `down -v`.
-The only thing you re-run after a `down`/`up` is `CREATE EXTERNAL TABLE` (example 6) — and
-K1/K4 for Kafka — because engine tables, sources and streams live inside the OtterStax
-container, not on a backend or a volume.
-
-The `exports/` prefix (example 7's `COPY` output) is **not** persisted seed data — the
-seed job clears it on every `up` (and `restart`), so a fresh start never shows a stale export. The Kafka
-broker is ephemeral: `qs-kafka-init` re-seeds `qs_orders` to the committed 40 events on
-every `up`.
+Whenever a seed job runs, it can change data even if the container or volume
+survived. The Kafka seed job deletes and recreates `qs_orders` and
+`qs_orders_paid`, then loads the 40 committed fixture records into `qs_orders`.
+After a reset, re-run example 6 and K1/K4 to rebuild the demo's local state.
 
 ---
 
 ## Teardown
 
-```bash
-docker compose down       # stop containers, KEEP data (volumes persist)
-docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/)
-```
+- Pause and keep the existing containers and their state with `docker compose stop`.
+  To resume, bring the existing backends back to health and then start
+  OtterStax separately. Use `--no-deps` to skip the seed jobs and
+  `--no-recreate` to keep the existing containers:
+
+  ```bash
+  docker compose up --wait --no-deps --no-recreate \
+    qs-postgres-shop qs-postgres-catalog qs-mariadb qs-clickhouse qs-rustfs qs-kafka &&
+  docker compose up --wait --no-deps --no-recreate qs-otterstax
+  ```
+
+- Remove the containers with `docker compose down`. This discards the local
+  engine and broker state and keeps the backend and RustFS volumes. The next
+  `up` runs the seed jobs.
+- Remove containers and all their named volumes with `docker compose down -v`.
+  The next `up` rebuilds the demo fixtures.
 
 ---
 
@@ -725,15 +824,15 @@ docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `up` fails: *port is already allocated* (8817) | The `examples/demo/` stack (or another) holds 8817 | Stop it first: `docker stop demo-otterstax` (or `docker compose -f examples/demo/compose.yml down`). |
-| `psql: connection refused` on 8817 | OtterStax still starting | Wait for `docker compose ps` to show `qs-otterstax` healthy (it waits for all backends first). |
+| `up` fails: *port is already allocated* (8817) | The `examples/demo/` stack (or another) holds 8817 | For the demo, see its [pause instructions](../demo/CLAUDE.md#pause-or-reset) for Docker and local mode. |
+| `psql: connection refused` on 8817 | OtterStax still starting | Check `docker compose ps qs-otterstax` and retry `SELECT 1` once it is healthy. |
 | `local.shop.customers` (or another `local.*` name of a backend table) does not exist | `local.*` names an engine table; a backend table is `alias.namespace.table` | Use the forms in [Backends & federation names](#backends--federation-names): `pgshop.shop.customers`, `pgcat.catalog.products`. |
-| My `local.qs.*` tables vanished after `down`/`up` | Engine tables live in the OtterStax container, which `down` removes | Re-run `sql/06_external_create.sql`. Backend + S3 data is still there (see [Persistence](#persistence--what-survives-a-restart)). |
-| `ROUND(x, 2)` errors / returns wrong output | 2-arg `ROUND` isn't pushed to backends | Use plain `SUM()` / `AVG()` (as the examples do). |
+| My `local.qs.*` tables vanished after `down`/`up` | Engine tables live in the OtterStax container, which `down` removes | Verify the S3 source objects, then run example 6. Use `-f sql/06_external_create.sql` from the quick start directory or `-f examples/quick_start/sql/06_external_create.sql` from the repository root, with `-v ON_ERROR_STOP=1`. |
+| `ROUND(x, 2)` errors (`unrecognized function 'round'`) | the engine has no `round` function (rc-7), at any arity | Use plain `SUM()` / `AVG()` (as the examples do) and round in the client. |
 | ClickHouse/MariaDB "client not found" on host | You don't have those CLIs | Use the `docker exec` forms in [Directly against each backend](#directly-against-each-backend-optional-sanity-check). |
-| `kafka.qs_orders` shows 0 rows | The poller is still ingesting (async) | Wait a few seconds and re-run the `SELECT` (K1). |
-| K2 join errors `path: 'name' was not found` | `name` exists in both `customers` and `products` — the mixed join can't resolve it | Project other columns (`country`/`tier`/`category`), as K2 does. |
-| `qs_orders_paid` empty after `CREATE STREAM` | The stream worker needs a moment | Wait a few seconds; check `docker logs qs-otterstax`. After a `down`/`up` the source and stream are gone — re-run K1/K4. |
+| `kafka.qs_orders` shows 0 or stale rows | Ingestion is still running, the topic is empty, or K1 kept rows and offsets from before a re-seed | [Verify the Kafka input and K1's local offsets](#verify-the-kafka-input), then retry the `SELECT`. If ingestion still fails, check `docker compose logs qs-otterstax`. |
+| K2 join errors `path: 'name' is ambiguous. Use aliases or full path` | `name` exists in both `customers` and `products` — the engine refuses the bare name | Qualify it (`c.name`), or project other columns (`country`/`tier`/`category`), as K2 does. |
+| `qs_orders_paid` empty after `CREATE STREAM` | The stream worker is starting, failed, or resumed at a committed offset | Check `docker compose logs qs-otterstax` and [replay K4 with a fresh group](#kafka-cleanup--re-running) if you need to reread the input. |
 
 ---
 
@@ -743,9 +842,9 @@ docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/
 |------|------|
 | `compose.yml` | the whole stack (backends + RustFS + Kafka + seed jobs + OtterStax) with named volumes |
 | `config.yaml` | OtterStax connection config (2×PG, MariaDB, ClickHouse, S3) — read at startup |
-| `sql/01…09_*.sql` | the nine core examples; `sql/cleanup.sql` drops engine state |
-| `sql/kafka_0{1..4}_*.sql` | the four Kafka examples; `sql/kafka_cleanup.sql` drops the source/stream |
-| `init/postgres_shop/`, `init/postgres_catalog/`, `init/mariadb/`, `init/clickhouse/` | committed DB seed SQL (auto-run on first container init) |
-| `init/s3/` | committed S3 fixtures (`regions.csv`, `product_costs.parquet`, `promotions.ndjson`) uploaded by `qs-rustfs-init` |
-| `init/kafka/orders.ndjson` | committed Kafka fixture (40 events) produced to `qs_orders` by `qs-kafka-init` |
-| `fixtures/generate.py` | **maintainer-only** regenerator for everything under `init/`. Not needed to run the demo (needs `faker` + `pyarrow`). |
+| `examples/quick_start/sql/0[1-9]_*.sql` | the nine core examples; `examples/quick_start/sql/cleanup.sql` resets all of `local.qs` |
+| `examples/quick_start/sql/kafka_0[1-4]_*.sql` | the four Kafka examples; `examples/quick_start/sql/kafka_cleanup.sql` drops the source/stream |
+| `examples/quick_start/init/postgres_shop/`, `examples/quick_start/init/postgres_catalog/`, `examples/quick_start/init/mariadb/`, `examples/quick_start/init/clickhouse/` | committed DB seed SQL (auto-run on first container init) |
+| `examples/quick_start/init/s3/` | committed S3 fixtures (`regions.csv`, `product_costs.parquet`, `promotions.ndjson`) uploaded by `qs-rustfs-init` |
+| `examples/quick_start/init/kafka/orders.ndjson` | committed Kafka fixture (40 events) produced to `qs_orders` by `qs-kafka-init` |
+| `examples/quick_start/fixtures/generate.py` | **maintainer-only** regenerator for everything under `examples/quick_start/init/`. Not needed to run the demo (needs `faker` + `pyarrow`). |

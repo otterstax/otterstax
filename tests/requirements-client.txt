@@ -1,0 +1,37 @@
+# Client libraries of the integration test image (Dockerfile.integration-test).
+# Exact versions: whatever PyPI serves on the day of a build is NOT what gets
+# tested. These are the versions of the last green image (python 3.12).
+#
+# A version bump is an edit of this file in a commit of its own, with a full
+# integration run (./docker-run-tests.sh) — see tests/CLAUDE.md.
+# Known traps: adbc-driver-manager 1.13 renamed get_objects' keyword arguments;
+# PyMySQL 1.4.6 dropped the _binary introducer (test_bytes_parameter).
+
+# Flight SQL: the original Apache drivers (tests/flightsql_e2e) and pyarrow.
+pyarrow==26.0.1
+flightsql-dbapi==0.2.2
+adbc-driver-flightsql==1.13.0
+adbc-driver-manager==1.13.0
+# grpcio-tools only regenerates the pre-generated Flight protobuf stubs.
+grpcio==1.85.3
+grpcio-tools==1.85.3
+protobuf==7.36.2
+
+# MySQL wire
+PyMySQL==1.2.4
+mysql-connector-python==26.10.0
+
+# PostgreSQL wire
+# psycopg[binary] written as its two packages: a constraints file (benchmark/requirements.txt) takes no extras.
+psycopg==3.3.9
+psycopg-binary==3.3.9
+psycopg2-binary==2.9.13
+asyncpg==0.32.0
+
+# Backends, Kafka, fixtures, harness
+clickhouse-driver==0.2.11
+confluent-kafka==2.16.2
+pytest==9.2.0
+tabulate==0.10.0
+Faker==40.54.0
+requests==2.34.2

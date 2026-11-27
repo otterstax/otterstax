@@ -235,7 +235,7 @@ namespace otterstax::federation {
                               "\" is ClickHouse, which has no transactions: a write inside a transaction block is "
                               "not supported");
             }
-            // MySQL's server answers what it has (MariaDB DELETE ... RETURNING; MySQL and an UPDATE refuse it).
+            // MySQL-family servers decide which RETURNING forms to accept. MariaDB supports UPDATE from 13.0.
             if (!returning.empty() && target.kind == backend_type_t::ClickHouse) {
                 return refuse(verb + " ... RETURNING of \"" + name + "\" is not supported: a ClickHouse mutation "
                                      "answers no rows");

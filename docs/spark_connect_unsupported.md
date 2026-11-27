@@ -127,8 +127,10 @@ Still refused (`unimplemented_yet`):
   reads no column, such as `count()`, is fine; so is a rename in the last
   `select()`.
 - An aggregate over a constant argument, e.g. `F.sum(F.lit(1))`:
-  `Spark sum() over a constant argument is not supported` — the engine would
-  fold one row per chunk instead of every row. `count()` of a non-NULL literal,
+  `Spark sum() over a constant argument is not supported` — an aggregate whose
+  arguments are all constants is a translation the frontend does not generate
+  (rc-3 folded one row per chunk; rc-7 evaluates them correctly, so only the
+  translation is missing). `count()` of a non-NULL literal,
   which is what `df.count()` and `groupBy().count()` send, counts every row as
   `count(*)`.
 

@@ -70,7 +70,7 @@ void stop_backends();                                           // idempotent; ~
   `backends.threads` is taken as is; below the sum of `pool_size`
   `backends_threads` logs a warning saying so (logger `BACKENDS`). The engine pools default to 3 threads; every pool takes
   1000 messages per actor before it yields its thread (`max_throughput`, a constant of
-  `runtime.cpp`).
+  `runtime/runtime.cpp`).
 - Not thread-safe: the assembling thread (`main`, a test) builds, lends and stops it.
 
 ## `engine_t`
@@ -143,7 +143,7 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
 - The logger is never registered with spdlog. Each engine owns its own logger, and
   `spdlog::set_level` / `initialize_all_loggers` never touch it.
 - Failures come back as `io_error` / `invalid_parameter` on `new_delete_resource`.
-  No exception leaves it. It is local to `engine.cpp`: `engine_t::open` is its
+  No exception leaves it. It is local to `runtime/engine.cpp`: `engine_t::open` is its
   one caller, and the tests reach it through it.
 
 ## Startup / shutdown order (`main.cpp`)
@@ -151,7 +151,7 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
 ```text
 command line, config::load_config → ServiceConfig{ engine, runtime, … }   (failures → stderr)
 initialize_all_loggers(config::log_directory(server_config.engine))   — log_dir, else data_dir
-runtime_t runtime(server_config.runtime, backends.threads resolved by backends::backends_threads)
+runtime_config.backends.threads = backends::backends_threads(<configured>, connections);  runtime_t runtime(runtime_config)
 remote_backends_t(runtime.resource(), {.runtime = &runtime}).open(connections, retry)
                                      → per connection: pool_size agents, the discovery, a backend actor
                                        (an unreachable one included); an error → log, return 1

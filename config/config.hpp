@@ -48,8 +48,9 @@ struct EngineConfig {
     std::string data_dir;
     // Where every log file of the server goes — otterstax's loggers and the
     // engine's lines, which share Main's sinks (config::log_directory: empty →
-    // data_dir). main.cpp creates the loggers there once the file is read; what
-    // goes wrong before (the arguments, the file itself) is written to stderr.
+    // data_dir, and `log_dir: ""` in the file reads as not set). main.cpp
+    // creates the loggers there once the file is read; what goes wrong before
+    // (the arguments, the file itself) is written to stderr.
     std::string log_dir;
 };
 
@@ -86,8 +87,9 @@ struct RuntimeConfig {
     // The frontend servers' threads; 0 = auto, max(2, hardware threads)
     // (otterstax::runtime::resolve_threads), for each.
     //  - mysql_io / postgres_io: the asio pool of the wire server. A connection
-    //    holds one of its threads while its statement runs (the bridge waits on
-    //    it), so the pool bounds the statements in flight over that wire.
+    //    holds no thread of the pool while its statement runs (its handler is a
+    //    coroutine on the connection's strand awaiting the session), so the
+    //    pool does not bound the statements in flight over that wire.
     //  - flight_sql_io: the GrpcContext threads of the Flight SQL server; its
     //    adapter blocks the calling thread for the length of a query, so the
     //    count bounds its queries in flight.

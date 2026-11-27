@@ -1,4 +1,4 @@
--- Example 8: Export a JOIN result back to S3 (COPY ... TO).
+-- Example 7: Export a JOIN result back to S3 (COPY ... TO).
 -- Joins the two S3-sourced engine tables and writes the result as CSV to
 -- s3://quickstart-bucket/exports/promo_costs.csv (browse it in the RustFS
 -- console afterwards). Requires example 6 to have run first.

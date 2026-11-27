@@ -1,0 +1,4 @@
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9
+Django>=5.2
+psycopg[binary]>=3.2

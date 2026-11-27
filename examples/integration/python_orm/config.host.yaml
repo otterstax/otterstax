@@ -1,0 +1,21 @@
+# OtterStax on the host, the quick start's backends in Docker (their published ports).
+#   cd examples/quick_start && docker compose up -d --wait --no-deps \
+#       qs-postgres-shop qs-postgres-catalog qs-mariadb qs-clickhouse
+#   <build>/server --config examples/integration/python_orm/config.host.yaml
+service:
+  mysql:    { port: 8816 }
+  postgres: { port: 8817 }
+  engine:   { data_dir: /tmp/otterstax_python_orm/data }
+
+connections:
+  postgresql:
+    - { alias: pgshop, host: 127.0.0.1, port: "3311", username: demo, password: demo,
+        database: shop, schema: shop, table: "" }
+    - { alias: pgcat,  host: 127.0.0.1, port: "3312", username: demo, password: demo,
+        database: catalog, schema: catalog, table: "" }
+  mysql:
+    - { alias: sales,  host: 127.0.0.1, port: "3310", username: demo, password: demo,
+        database: ops, table: "" }
+  clickhouse:
+    - { alias: web,    host: 127.0.0.1, port: "3313", username: demo, password: demo,
+        database: analytics, table: "" }

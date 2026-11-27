@@ -60,12 +60,14 @@ also have digest pins. These pins address past failures from changes to the ADBC
   `benchmark/compose_rustfs.yml`). Docker pulls by digest. The integration test's
   `tests/s3/Dockerfile.fixtures` also pins its AWS CLI base image by digest.
   The examples' AWS CLI seed jobs still use `latest`.
-- The GitHub [Version Pins workflow](../.github/workflows/pins.yml) runs
+- The GitHub [Version Pins and Documentation References workflow](../.github/workflows/pins.yml) runs
   `scripts/check_pins.sh` on pull requests to main, pushes to main, and daily.
   It checks Python constraint consistency, agreement among RustFS pins, and
   whether the release tag and `latest` still resolve to the pinned digest.
   If only `latest` has moved, this check fails while Compose continues to pull
   the recorded digest. Review the new image before bumping the pin.
+  A separate job in the same workflow checks documentation references with
+  `scripts/tools/doc_refs_check.py`.
 - **A bump is its own commit**: edit the requirements file (or the version and digest together, the digest
   of the release's tag: `docker buildx imagetools inspect rustfs/rustfs:<version>`) and nothing else, then
   a full `./docker-run-tests.sh` — image build, `rustfs-init` seed, integration suite — before it merges.

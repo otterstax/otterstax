@@ -1,7 +1,7 @@
 name: Docker image
 
 # The public server image (Dockerfile, target `runtime`):
-#   ghcr.io/otterstax/otterstax:<version> and docker.io/otterstax/otterstax:<version>
+#   ghcr.io/otterstax/otterstax:<version>
 # Pushed for a version tag (v0.2.0 -> 0.2.0) or a manual run that names a
 # version. A pull request touching the image only builds it.
 on:
@@ -55,13 +55,6 @@ jobs:
           variant: release
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Log in to Docker Hub
-        if: steps.version.outputs.push == 'true'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -74,8 +67,6 @@ jobs:
           build-args: |
             DEPS_IMAGE=${{ steps.deps.outputs.image }}
             BUILD_JOBS=0
-          tags: |
-            ghcr.io/otterstax/otterstax:${{ steps.version.outputs.version || 'build' }}
-            docker.io/otterstax/otterstax:${{ steps.version.outputs.version || 'build' }}
+          tags: ghcr.io/otterstax/otterstax:${{ steps.version.outputs.version || 'build' }}
           cache-from: type=gha,scope=image
           cache-to: type=gha,mode=max,scope=image

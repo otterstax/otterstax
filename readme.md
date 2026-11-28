@@ -190,7 +190,7 @@ cmake --build build/Release --parallel <JOBS>
 ## Docker
 
 ```bash
-docker pull ghcr.io/otterstax/otterstax:0.2.0      # or: otterstax/otterstax:0.2.0 (Docker Hub)
+docker pull ghcr.io/otterstax/otterstax:0.2.0
 
 docker run -d --name otterstax --stop-timeout 60 \
   -p 8815:8815 -p 8816:8816 -p 8817:8817 -p 15002:15002 \

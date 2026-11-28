@@ -198,7 +198,9 @@ docker run -d --name otterstax --stop-timeout 60 \
   ghcr.io/otterstax/otterstax:0.2.0
 ```
 
-The image is published for Linux amd64. Two paths matter:
+The image is published for Linux amd64, one tag per release and no `latest`: the newest version is
+listed on the [package page](https://github.com/otterstax/otterstax/pkgs/container/otterstax) and
+under [Releases](https://github.com/otterstax/otterstax/releases). Two paths matter:
 
 - `/otterstax/config.yaml` is the config. The image ships one that sets only the data directory,
   so the command above starts with default ports and no connections. To supply

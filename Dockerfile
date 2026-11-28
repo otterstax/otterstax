@@ -96,9 +96,11 @@ CMD [ "./server" ]
 # sessions and write the final CHECKPOINT (`docker stop -t 60`).
 FROM ubuntu:22.04 AS runtime
 
+# libquadmath0: the server links libquadmath.so.0 on amd64 (gcc's __float128
+# runtime), which the conan packages in lib/ do not carry.
 RUN apt update && \
     DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
-        ca-certificates tzdata && \
+        ca-certificates tzdata libquadmath0 && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

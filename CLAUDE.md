@@ -479,6 +479,26 @@ its target resolves to a registered object in `local.kafka`. `INSERT … VALUES`
 `INSERT … SELECT` requires a STREAM target and registers a continuous query.
 See `integration/kafka/CLAUDE.md`.
 
+## Application Integration
+
+How an application or ORM uses OtterStax: `docs/integration.md` (the general approach, for any
+language), with the framework code (Django, SQLAlchemy) and the runnable example
+`examples/integration/python_orm/` in `examples/integration/CLAUDE.md`. In short:
+
+- clients connect over the PostgreSQL wire, the database name is the session's place (`local`
+  reaches every connection), and an ORM's schema slot takes `alias.namespace`
+  (`catalog::split_dotted_names`);
+- the backends own their schemas: no reflection (pg_catalog lacks the columns ORMs read), a remote
+  `CREATE TABLE` without keys / defaults / `serial` and only in autocommit, no generated ids in `local`
+  tables — so a framework's own tables (migrations, auth) live in an ordinary database beside
+  OtterStax;
+- one written backend per transaction; a backend table created after startup fails its first use
+  inside a transaction (the miss's registration retries only outside a block).
+
+A change to what a client driver sees — the wire frontends, pg_catalog and the catalog functions, name
+resolution, transactions, generated ids, types — re-runs the example and updates both documents
+(`examples/integration/CLAUDE.md`, "When the server changes").
+
 ## Directory Map
 
 | Directory | CMake target | Role |
@@ -499,7 +519,7 @@ See `integration/kafka/CLAUDE.md`.
 | `cmake/` | — | conan hooks |
 | `scripts/` | — | repository scripts: `scripts/format.sh` (the formatter, over `scripts/tools/code-fromat.py`), the root manual stack's `scripts/database/config.yaml` and `scripts/database/healthcheck.sh`, and `scripts/tools/doc_refs_check.py`, which checks that every path the documentation quotes is a tracked file or directory (CI runs `python3 scripts/tools/doc_refs_check.py .` from the repo root; exit 1 on an unresolved one) |
 | `tests/` | the 12 binaries above | Catch2 suites + the python integration suite and PySpark client matrix. `tests/CLAUDE.md` |
-| `benchmark/`, `examples/` | — | benchmark harness (`benchmark/CLAUDE.md`), demo and quick start stacks |
+| `benchmark/`, `examples/` | — | benchmark harness (`benchmark/CLAUDE.md`), demo and quick start stacks, `examples/integration/` (framework integration code and the runnable Django / SQLAlchemy example, `examples/integration/CLAUDE.md`) |
 
 ## Known Constraints
 

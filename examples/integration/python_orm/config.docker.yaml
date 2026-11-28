@@ -1,0 +1,19 @@
+# OtterStax in Docker on the quick start's network (quick_start_quickstart_net): the backends by
+# their compose service names and container ports. Mounted at /otterstax/config.yaml.
+service:
+  mysql:    { port: 8816 }
+  postgres: { port: 8817 }
+  engine:   { data_dir: /otterstax/data }
+
+connections:
+  postgresql:
+    - { alias: pgshop, host: qs-postgres-shop, port: "5432", username: demo, password: demo,
+        database: shop, schema: shop, table: "" }
+    - { alias: pgcat,  host: qs-postgres-catalog, port: "5432", username: demo, password: demo,
+        database: catalog, schema: catalog, table: "" }
+  mysql:
+    - { alias: sales,  host: qs-mariadb, port: "3306", username: demo, password: demo,
+        database: ops, table: "" }
+  clickhouse:
+    - { alias: web,    host: qs-clickhouse, port: "9000", username: demo, password: demo,
+        database: analytics, table: "" }
